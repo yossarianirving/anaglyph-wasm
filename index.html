@@ -1,0 +1,118 @@
+<html>
+  <head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type"/>
+  </head>
+  <body>
+    <form id="imageForm" enctype="multipart/form-data">
+      <label for="leftImage">Upload Left Image:</label>
+      <input type="file" id="leftImage" name="leftImage" accept="image/*"><br><br>
+      
+      <label for="rightImage">Upload Right Image:</label>
+      <input type="file" id="rightImage" name="rightImage" accept="image/*"><br><br>
+      
+      <input type="submit" value="Submit">
+    </form>
+
+    <canvas id="result" width=100 height=100></canvas>
+    <!-- Note the usage of `type=module` here as this is an ES6 module -->
+    <script type="module">
+      // Use ES module import syntax to import functionality from the module
+      // that we have compiled.
+      //
+      // Note that the `default` import is an initialization function which
+      // will "boot" the module and make it ready to use. Currently browsers
+      // don't support natively imported WebAssembly as an ES module, but
+      // eventually the manual initialization won't be required!
+      import init, { Anaglyph } from './pkg/anaglyph_wasm.js';
+      var anaglyph;
+      var leftLoaded = false;
+      var rightLoaded = false;
+      async function run() {
+
+        await init();
+
+        // And afterwards we can use all the functionality defined in wasm.
+        anaglyph = Anaglyph.new();
+        console.log("init")
+      }
+
+      function bothLoaded() {
+        if (leftLoaded && rightLoaded) {
+          leftLoaded = false
+          rightLoaded = false
+
+          var height = anaglyph.get_height();
+          var width = anaglyph.get_width();
+          var s = performance.now();
+          var ana_data = new Uint8ClampedArray(anaglyph.to_anaglyph("color"));
+          console.log("To anaglyph took: ", performance.now() - s, "ms?")
+          var iData = new ImageData(ana_data, width, height);
+          var c = document.getElementById("result");
+          c.width = width;
+          c.height = height
+          var ctx = c.getContext('2d');
+          ctx.putImageData(iData, 0, 0)
+        }
+      }
+      
+      document.getElementById("imageForm").addEventListener('submit', function(event) {
+        event.preventDefault();
+
+        console.log("sdf")
+        var leftFile = document.getElementById('leftImage').files[0];
+        var rightFile = document.getElementById('rightImage').files[0];
+        
+        // Check if files are selected
+        if (leftFile && rightFile) {
+            var leftReader = new FileReader();
+            var rightReader = new FileReader();
+
+            leftReader.onload = function(event) {
+                var leftImage = new Image();
+                leftImage.src = event.target.result;
+                leftImage.onload = function() {
+                    var canvas = document.createElement('canvas');
+                    canvas.width = leftImage.width;
+                    canvas.height = leftImage.height;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(leftImage, 0, 0);
+                    var leftImageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                    var leftUint8ClampedArray = new Uint8ClampedArray(leftImageData);
+                    var t = anaglyph.set_left_image(canvas.width, canvas.height, leftUint8ClampedArray);
+                    leftLoaded = true
+                    bothLoaded();
+                };
+            };
+
+            rightReader.onload = function(event) {
+                var rightImage = new Image();
+                rightImage.src = event.target.result;
+                rightImage.onload = function() {
+                    var canvas = document.createElement('canvas');
+                    canvas.width = rightImage.width;
+                    canvas.height = rightImage.height;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(rightImage, 0, 0);
+                    var rightImageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                    var rightUint8ClampedArray = new Uint8ClampedArray(rightImageData);
+                    var t = anaglyph.set_right_image(canvas.width, canvas.height, rightUint8ClampedArray)
+                    rightLoaded = true;
+                    bothLoaded();
+                };
+            };
+
+            // Read files as Data URLs
+            leftReader.readAsDataURL(leftFile);
+            rightReader.readAsDataURL(rightFile);
+        } else {
+            console.error("Please select both left and right images.");
+        }
+      })
+
+      run();
+
+    </script>
+
+    
+  </body>
+</html>
