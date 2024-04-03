@@ -27,6 +27,7 @@
       var anaglyph;
       var leftLoaded = false;
       var rightLoaded = false;
+      var start = 0;
       async function run() {
 
         await init();
@@ -40,6 +41,7 @@
         if (leftLoaded && rightLoaded) {
           leftLoaded = false
           rightLoaded = false
+          console.log("Both loaded took ", performance.now() - start, " ms");
 
           var height = anaglyph.get_height();
           var width = anaglyph.get_width();
@@ -52,13 +54,14 @@
           c.height = height
           var ctx = c.getContext('2d');
           ctx.putImageData(iData, 0, 0)
+          console.log("Final time ", performance.now() - start, " ms")
         }
       }
       
       document.getElementById("imageForm").addEventListener('submit', function(event) {
         event.preventDefault();
 
-        console.log("sdf")
+        start = performance.now();
         var leftFile = document.getElementById('leftImage').files[0];
         var rightFile = document.getElementById('rightImage').files[0];
         
