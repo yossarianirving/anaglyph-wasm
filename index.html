@@ -71,7 +71,11 @@
             var rightReader = new FileReader();
 
             leftReader.onload = function(event) {
-                var leftImage = new Image();
+                var bytes = new Uint8ClampedArray(event.target.result)
+                anaglyph.set_left_image_raw(bytes);
+                leftLoaded = true
+                bothLoaded()
+                {{/*  var leftImage = new Image();
                 leftImage.src = event.target.result;
                 leftImage.onload = function() {
                     var canvas = document.createElement('canvas');
@@ -84,11 +88,15 @@
                     var t = anaglyph.set_left_image(canvas.width, canvas.height, leftUint8ClampedArray);
                     leftLoaded = true
                     bothLoaded();
-                };
+                };  */}}
             };
 
             rightReader.onload = function(event) {
-                var rightImage = new Image();
+                var bytes = new Uint8ClampedArray(event.target.result)
+                anaglyph.set_right_image_raw(bytes);
+                rightLoaded = true
+                bothLoaded()
+                {{/*  var rightImage = new Image();
                 rightImage.src = event.target.result;
                 rightImage.onload = function() {
                     var canvas = document.createElement('canvas');
@@ -101,12 +109,12 @@
                     var t = anaglyph.set_right_image(canvas.width, canvas.height, rightUint8ClampedArray)
                     rightLoaded = true;
                     bothLoaded();
-                };
+                };  */}}
             };
 
             // Read files as Data URLs
-            leftReader.readAsDataURL(leftFile);
-            rightReader.readAsDataURL(rightFile);
+            leftReader.readAsArrayBuffer(leftFile);
+            rightReader.readAsArrayBuffer(rightFile);
         } else {
             console.error("Please select both left and right images.");
         }
