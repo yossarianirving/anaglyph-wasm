@@ -9,6 +9,13 @@
       
       <label for="rightImage">Upload Right Image:</label>
       <input type="file" id="rightImage" name="rightImage" accept="image/*"><br><br>
+
+      <label for="xOffset">Offset x:</label>
+      <input type="number" id="xOffset" name="xOffset" value="0"><br><br>
+
+      <label for="yOffset">Offset y:</label>
+      <input type="number" id="yOffset" name="yOffset" value="0"><br><br>
+
       
       <input type="submit" value="Submit">
     </form>
@@ -42,19 +49,20 @@
           leftLoaded = false
           rightLoaded = false
           console.log("Both loaded took ", performance.now() - start, " ms");
-
-          var height = anaglyph.get_height();
-          var width = anaglyph.get_width();
+          var xOffset = parseInt(document.getElementById('xOffset').value);
+          var yOffset = parseInt(document.getElementById('yOffset').value);
           var s = performance.now();
-          var ana_data = new Uint8ClampedArray(anaglyph.to_anaglyph("color"));
+          var ana_result = anaglyph.to_anaglyph("grayscale", xOffset, yOffset);
+          var ana_data = new Uint8ClampedArray(ana_result.get_image());
           console.log("To anaglyph took: ", performance.now() - s, "ms?")
-          var iData = new ImageData(ana_data, width, height);
+          var iData = new ImageData(ana_data, ana_result.width, ana_result.height);
           var c = document.getElementById("result");
-          c.width = width;
-          c.height = height
+          c.width = ana_result.width;
+          c.height = ana_result.height
           var ctx = c.getContext('2d');
           ctx.putImageData(iData, 0, 0)
           console.log("Final time ", performance.now() - start, " ms")
+          
         }
       }
       
@@ -75,20 +83,6 @@
                 anaglyph.set_left_image_raw(bytes);
                 leftLoaded = true
                 bothLoaded()
-                {{/*  var leftImage = new Image();
-                leftImage.src = event.target.result;
-                leftImage.onload = function() {
-                    var canvas = document.createElement('canvas');
-                    canvas.width = leftImage.width;
-                    canvas.height = leftImage.height;
-                    var ctx = canvas.getContext('2d');
-                    ctx.drawImage(leftImage, 0, 0);
-                    var leftImageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-                    var leftUint8ClampedArray = new Uint8ClampedArray(leftImageData);
-                    var t = anaglyph.set_left_image(canvas.width, canvas.height, leftUint8ClampedArray);
-                    leftLoaded = true
-                    bothLoaded();
-                };  */}}
             };
 
             rightReader.onload = function(event) {
@@ -96,20 +90,6 @@
                 anaglyph.set_right_image_raw(bytes);
                 rightLoaded = true
                 bothLoaded()
-                {{/*  var rightImage = new Image();
-                rightImage.src = event.target.result;
-                rightImage.onload = function() {
-                    var canvas = document.createElement('canvas');
-                    canvas.width = rightImage.width;
-                    canvas.height = rightImage.height;
-                    var ctx = canvas.getContext('2d');
-                    ctx.drawImage(rightImage, 0, 0);
-                    var rightImageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-                    var rightUint8ClampedArray = new Uint8ClampedArray(rightImageData);
-                    var t = anaglyph.set_right_image(canvas.width, canvas.height, rightUint8ClampedArray)
-                    rightLoaded = true;
-                    bothLoaded();
-                };  */}}
             };
 
             // Read files as Data URLs

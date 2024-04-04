@@ -11,5 +11,15 @@ anaglyph-rs = { path = "../anaglyph-rs" }
 image = "0.25.1"
 wasm-bindgen = "0.2.92"
 
+[dependencies.web-sys]
+version = "0.3.4"
+features = [
+  'console'
+]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+#opt-level=3
+#lto=true
