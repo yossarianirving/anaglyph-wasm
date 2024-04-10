@@ -26,8 +26,8 @@ impl<'a> Drop for Timer<'a> {
 #[wasm_bindgen]
 #[derive(Default)] 
 pub struct Anaglyph {
-    left_image: RgbaImage,
-    right_image: RgbaImage,
+    left_image: RgbImage,
+    right_image: RgbImage,
     anaglyph_type: Option<AnaglyphType>
 }
 
@@ -46,27 +46,27 @@ impl Anaglyph {
 
     pub fn set_left_image(&mut self, width: u32, height: u32, left_image: Vec<u8>) -> bool {
         
-        self.left_image =  RgbaImage::from_raw(width, height, left_image).unwrap() as RgbaImage;
+        self.left_image =  RgbImage::from_raw(width, height, left_image).unwrap() as RgbImage;
         true
     }
 
     pub fn set_right_image(&mut self, width: u32, height: u32, right_image: Vec<u8>) -> bool {
-        self.right_image = RgbaImage::from_raw(width, height, right_image).unwrap().convert();
+        self.right_image = RgbImage::from_raw(width, height, right_image).unwrap().convert();
         true
     }
 
     pub fn set_right_image_raw(&mut self, right_image: Vec<u8>) {
         let _timer = Timer::new("Load raw image");
-        self.right_image = ImageReader::new(Cursor::new(right_image)).with_guessed_format().unwrap().decode().unwrap().to_rgba8();
+        self.right_image = ImageReader::new(Cursor::new(right_image)).with_guessed_format().unwrap().decode().unwrap().to_rgb8();
     }
 
     pub fn set_left_image_raw(&mut self, left_image: Vec<u8>) {
         let _timer = Timer::new("Load raw image");
-        self.left_image = ImageReader::new(Cursor::new(left_image)).with_guessed_format().unwrap().decode().unwrap().to_rgba8();
+        self.left_image = ImageReader::new(Cursor::new(left_image)).with_guessed_format().unwrap().decode().unwrap().to_rgb8();
     }
 
     pub fn set_stereoscopic_image(&mut self, width: u32, height: u32, stereo_image: Vec<u8>) -> bool {
-        let stereoscopic_image = RgbaImage::from_raw(width, height, stereo_image);
+        let stereoscopic_image = RgbImage::from_raw(width, height, stereo_image);
 
         if width % 2 != 0 {
             return false;
@@ -91,17 +91,13 @@ impl Anaglyph {
         };
         let _timer = Timer::new("To Anaglyph");
 
-        let left_rgb = self.left_image.convert() as RgbImage;
-        let right_rgb = self.right_image.convert() as RgbImage;
-        
         let offset: Offset = Offset {
             x: offset_x,
             y: offset_y
         };
 
-        let anaglyph_image = left_right_to_anaglyph_offset(&left_rgb, &right_rgb, a_type, offset);
+        let anaglyph_image = left_right_to_anaglyph_offset(&self.left_image, &self.right_image, a_type, offset);
 
-        drop(_timer);
         AnaglyphResult {
             image_vec: (anaglyph_image.convert() as RgbaImage).into_vec(),
             height: anaglyph_image.height(),

@@ -17,10 +17,10 @@
       <input type="number" id="yOffset" name="yOffset" value="0"><br><br>
 
       
-      <input type="submit" value="Submit">
+      <input type="submit" id="submit" value="Submit" disabled>
     </form>
 
-    <canvas id="result" width=100 height=100></canvas>
+    <canvas id="result"></canvas>
     <!-- Note the usage of `type=module` here as this is an ES6 module -->
     <script type="module">
       // Use ES module import syntax to import functionality from the module
@@ -35,73 +35,66 @@
       var leftLoaded = false;
       var rightLoaded = false;
       var start = 0;
+      var worker = new Worker('anaglyph-worker.js', { type: 'module' });
+      worker.onmessage = function(e) {
+        console.log(e.data)
+        switch (e.data.type) {
+          case 'anaglyph-result':
+            var result = e.data.image;
+            var canvas = document.getElementById('result');
+            canvas.height = result.height;
+            canvas.width = result.width;
+            canvas.style.width = "95%"
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(result, 0, 0, canvas.width, canvas.height);
+            console.log("Time taken: " + (performance.now() - start) + "ms");
+            break;
+          case 'left-image-loaded':
+            leftLoaded = true;
+            console.log("Left image loaded");
+            if (rightLoaded) {
+              document.getElementById("submit").disabled = false;
+            }
+            break;
+          case 'right-image-loaded':
+            rightLoaded = true;
+            console.log("Right image loaded");
+            if (leftLoaded) {
+              document.getElementById("submit").disabled = false;
+            }
+            break;
+        }
+      };
       async function run() {
 
         await init();
 
         // And afterwards we can use all the functionality defined in wasm.
         anaglyph = Anaglyph.new();
-        console.log("init")
       }
+      run();
 
-      function bothLoaded() {
-        if (leftLoaded && rightLoaded) {
-          leftLoaded = false
-          rightLoaded = false
-          console.log("Both loaded took ", performance.now() - start, " ms");
-          var xOffset = parseInt(document.getElementById('xOffset').value);
-          var yOffset = parseInt(document.getElementById('yOffset').value);
-          var s = performance.now();
-          var ana_result = anaglyph.to_anaglyph("grayscale", xOffset, yOffset);
-          var ana_data = new Uint8ClampedArray(ana_result.get_image());
-          console.log("To anaglyph took: ", performance.now() - s, "ms?")
-          var iData = new ImageData(ana_data, ana_result.width, ana_result.height);
-          var c = document.getElementById("result");
-          c.width = ana_result.width;
-          c.height = ana_result.height
-          var ctx = c.getContext('2d');
-          ctx.putImageData(iData, 0, 0)
-          console.log("Final time ", performance.now() - start, " ms")
-          
-        }
-      }
       
       document.getElementById("imageForm").addEventListener('submit', function(event) {
         event.preventDefault();
 
         start = performance.now();
-        var leftFile = document.getElementById('leftImage').files[0];
-        var rightFile = document.getElementById('rightImage').files[0];
+        var xOffset = parseInt(document.getElementById('xOffset').value);
+        var yOffset = parseInt(document.getElementById('yOffset').value);
         
-        // Check if files are selected
-        if (leftFile && rightFile) {
-            var leftReader = new FileReader();
-            var rightReader = new FileReader();
-
-            leftReader.onload = function(event) {
-                var bytes = new Uint8ClampedArray(event.target.result)
-                anaglyph.set_left_image_raw(bytes);
-                leftLoaded = true
-                bothLoaded()
-            };
-
-            rightReader.onload = function(event) {
-                var bytes = new Uint8ClampedArray(event.target.result)
-                anaglyph.set_right_image_raw(bytes);
-                rightLoaded = true
-                bothLoaded()
-            };
-
-            // Read files as Data URLs
-            leftReader.readAsArrayBuffer(leftFile);
-            rightReader.readAsArrayBuffer(rightFile);
-        } else {
-            console.error("Please select both left and right images.");
-        }
+        worker.postMessage({type: 'anaglyph-submit', offset: {x: xOffset, y: yOffset }, anaglyphType: "half-color" });
       })
 
-      run();
 
+      document.getElementById('rightImage').addEventListener('change', function(e) {
+        worker.postMessage({type: 'uploadRightImage', image: e.target.files[0]});
+        console.log("Sent right image to worker");
+      });
+
+      document.getElementById('leftImage').addEventListener('change', function(e) {
+        worker.postMessage({type: 'uploadLeftImage', image: e.target.files[0]});
+        console.log("Sent left image to worker");
+      });
     </script>
 
     
