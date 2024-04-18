@@ -1,26 +1,37 @@
 <html>
   <head>
     <meta content="text/html;charset=utf-8" http-equiv="Content-Type"/>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-EVSTQN3/azprG1Anm3QDgpJLIm9Nao0Yz1ztcQTwFspd3yD65VohhpuuCOmLASjC" crossorigin="anonymous">
+
   </head>
   <body>
-    <form id="imageForm" enctype="multipart/form-data">
-      <label for="leftImage">Upload Left Image:</label>
-      <input type="file" id="leftImage" name="leftImage" accept="image/*"><br><br>
-      
-      <label for="rightImage">Upload Right Image:</label>
-      <input type="file" id="rightImage" name="rightImage" accept="image/*"><br><br>
+    <main class="container">
+      <form id="imageForm" enctype="multipart/form-data">
+        <div class="mb-3">
+          <label for="leftImage" class="form-label">Upload Left Image:</label>
+          <input type="file" class="form-control" id="leftImage" name="leftImage" accept="image/*">
+        </div>
+        
+        <div class="mb-3">
+          <label for="rightImage" class="form-label">Upload Right Image:</label>
+          <input type="file" class="form-control" id="rightImage" name="rightImage" accept="image/*">
+        </div>
 
-      <label for="xOffset">Offset x:</label>
-      <input type="number" id="xOffset" name="xOffset" value="0"><br><br>
+        <div class="mb-3">
+          <label for="xOffset" class="form-label">Offset x:</label>
+          <input type="number" class="form-control" id="xOffset" name="xOffset" value="0">
+        </div>
 
-      <label for="yOffset">Offset y:</label>
-      <input type="number" id="yOffset" name="yOffset" value="0"><br><br>
+        <div class="mb-3">
+          <label for="yOffset" class="form-label">Offset y:</label>
+          <input type="number" class="form-control" id="yOffset" name="yOffset" value="0">
+        </div>
 
-      
-      <input type="submit" id="submit" value="Submit" disabled>
-    </form>
+        <button type="submit" class="btn btn-primary" id="submit" disabled>Submit</button>
+      </form>
 
-    <canvas id="result"></canvas>
+      <canvas id="result"></canvas>
+    </main>
     <!-- Note the usage of `type=module` here as this is an ES6 module -->
     <script type="module">
       // Use ES module import syntax to import functionality from the module
