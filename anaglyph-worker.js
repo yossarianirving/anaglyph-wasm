@@ -15,14 +15,18 @@ self.onmessage = function (e) {
     case "uploadLeftImage":
       handleLeftImageUpload(e);
       break;
-
     case "uploadRightImage":
       handleRightImageUpload(e);
+      break;
+    case "uploadGif":
+      handleGifUpload(e);
       break;
     case "anaglyph-submit":
       handleAnaglyphSubmit(e);
       break;
-
+    case "anaglyph-submit-gif":
+      handleAnaglyphSubmitGif(e);
+      break;
     default:
       break;
   }
@@ -42,7 +46,11 @@ async function handleRightImageUpload(e) {
   postMessage({ type: "right-image-loaded" });
 }
 
-async function handleGifUpload(e) {}
+async function handleGifUpload(e) {
+  var gifData = new Uint8Array(await e.data.gif.arrayBuffer());
+  anaglyph.set_gif(gifData);
+  postMessage({ type: "gif-loaded" });
+}
 
 function handleAnaglyphSubmit(e) {
   var offset = e.data.offset;
@@ -59,4 +67,13 @@ function handleAnaglyphSubmit(e) {
   ctx.putImageData(imageData, 0, 0);
   var imageBitmap = canvas.transferToImageBitmap();
   postMessage({ type: "anaglyph-result", image: imageBitmap }, [imageBitmap]);
+}
+
+function handleAnaglyphSubmitGif(e) {
+  var anaglyphType = e.data.anaglyphType;
+  var videoDirection = e.data.videoDirection;
+  var resultGif = anaglyph.gif_to_anaglyph(anaglyphType, videoDirection);
+  var blob = new Blob([new Uint8Array(resultGif)], { type: "image/gif" });
+  var url = URL.createObjectURL(blob);
+  postMessage({ type: "anaglyph-result-gif", url: url });
 }
