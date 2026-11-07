@@ -1,25 +1,22 @@
 /**
- * End-to-end smoke test for the browser video pipeline.
+ * End-to-end tests for the browser video pipeline.
  *
- * Serves the repo, drives video.html in headless Chromium through the two
- * bundled sample clips (silent and AAC), and validates each output file with
- * ffprobe (codec, frame count, audio stream presence, duration).
+ * Serves the repo, drives video.html in headless Chromium across the sample
+ * clips in bench/, and validates each result with ffprobe (codec, dimensions,
+ * frame count, audio streams, rotation metadata).
  *
  * Usage: node bench/e2e-video.mjs [name-filter] [--headed] [--gpu]
  *
- * Note: headless Chromium encodes/decodes on the CPU; the shipped
- * headless-shell build exposes no WebGPU at all (and full chromium here
- * falls back without a GPU process), so this run covers the CPU blend path.
- * The WebGPU blend path is exercised on real hardware via gif.html/bench.html
- * (same `blend_rgba_async` code) and `--headed` runs. Performance numbers
- * come from bench-video.html on real hardware.
+ * Headless Chromium runs software codecs and (depending on the build) has no
+ * WebGPU adapter, so throughput here is a correctness signal only;
+ * performance comes from bench-video.html on real hardware.
  *
- * Note on frame counts: this input's container marks one trailing packet
- * discardable; ffmpeg's decoder drops it (native CLI: N-2 pairs) while
- * WebCodecs decodes it (browser: N-1 pairs). The extra frame is appended at
- * the end and does not shift any earlier pairing.
+ * Note on frame counts: booth2s.mp4 marks one trailing packet discardable;
+ * ffmpeg's decoder drops it (native CLI: N-2 pairs) while WebCodecs decodes
+ * it (browser: N-1 pairs). The extra frame is appended at the end and does
+ * not shift any earlier pairing.
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,25 +25,66 @@ import { chromium } from "playwright";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const PORT = 8123;
 const BASE = `http://localhost:${PORT}`;
+const sample = (name) => join(root, "bench", name);
+
+/** ffprobe a file, returning a compact multi-line summary (streams + video side data). */
+function probe(file) {
+  const streams = execFileSync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-count_frames",
+      "-show_entries",
+      "stream=index,codec_type,codec_name,width,height,nb_read_frames",
+      "-of",
+      "compact",
+      file,
+    ],
+  ).toString();
+  const side = execFileSync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-read_intervals",
+      "%+#1",
+      "-show_entries",
+      "frame_side_data_list",
+      "-of",
+      "compact",
+      file,
+    ],
+  ).toString();
+  return streams + side;
+}
 
 const CASES = [
   {
     name: "silent sample",
-    file: join(root, "bench", "booth2s.mp4"),
+    file: sample("booth2s.mp4"),
     expectAudio: false,
+    check(report, output) {
+      requireStream(output, "codec_type=video", "codec_name=h264");
+      requireNoStream(output, "codec_type=audio");
+    },
   },
   {
     name: "aac sample",
-    file: join(root, "bench", "booth2s-aac.mp4"),
+    file: sample("booth2s-aac.mp4"),
     expectAudio: true,
+    check(report, output) {
+      requireStream(output, "codec_type=audio", "codec_name=aac");
+    },
   },
   {
     // Forward + reverse concat: exactly one reversal, verified against the
-    // native CLI:
-    //   anaglyph-rs --video bench/boomerang.mp4 -d auto
-    //   -> "reversal at 5.67s (frame 190): counter-clockwise -> clockwise"
+    // native CLI (`anaglyph-rs --video bench/boomerang.mp4 -d auto`):
+    //   "reversal at 5.67s (frame 190): counter-clockwise -> clockwise"
     name: "boomerang auto",
-    file: join(root, "bench", "boomerang.mp4"),
+    file: sample("boomerang.mp4"),
     direction: "auto",
     expectAudio: false,
     check(report) {
@@ -54,24 +92,18 @@ const CASES = [
         throw new Error(`expected auto direction, got "${report.direction}"`);
       }
       const reversals =
-        report.reversals === "none detected"
-          ? []
-          : report.reversals.split("; ");
+        report.reversals === "none detected" ? [] : report.reversals.split("; ");
       if (reversals.length !== 1) {
         throw new Error(
           `expected exactly 1 reversal (native CLI reference), got ${reversals.length}: "${report.reversals}"`,
         );
       }
       if (!/counter-clockwise -> clockwise/.test(reversals[0])) {
-        throw new Error(
-          `reversal direction mismatch, got "${reversals[0]}" (native: counter-clockwise -> clockwise at 5.67s)`,
-        );
+        throw new Error(`reversal direction mismatch, got "${reversals[0]}"`);
       }
       const seconds = Number(/([0-9.]+)s/.exec(reversals[0])?.[1]);
       if (!(Math.abs(seconds - 5.67) <= 0.1)) {
-        throw new Error(
-          `reversal time ${seconds}s deviates from native reference 5.67s`,
-        );
+        throw new Error(`reversal time ${seconds}s deviates from 5.67s`);
       }
     },
   },
@@ -79,23 +111,88 @@ const CASES = [
     // Same clip with the eyes swapped: native `-d auto-reverse` reports the
     // mirrored reversal "clockwise -> counter-clockwise".
     name: "boomerang auto-reverse",
-    file: join(root, "bench", "boomerang.mp4"),
+    file: sample("boomerang.mp4"),
     direction: "auto-reverse",
     expectAudio: false,
     check(report) {
       if (report.direction !== "auto (reversed)") {
-        throw new Error(
-          `expected "auto (reversed)" direction label, got "${report.direction}"`,
-        );
+        throw new Error(`expected "auto (reversed)" label, got "${report.direction}"`);
       }
       if (!/^5\.6\d+s clockwise -> counter-clockwise$/.test(report.reversals)) {
-        throw new Error(
-          `expected mirrored reversal at ~5.67s, got "${report.reversals}"`,
-        );
+        throw new Error(`expected mirrored reversal at ~5.67s, got "${report.reversals}"`);
       }
     },
   },
+  {
+    // VP9 in WebM with odd coded dimensions (481x271): the pipeline crops to
+    // even dimensions for H.264, and the WebM source itself must decode.
+    name: "odd dims",
+    file: sample("odd-dims.webm"),
+    expectAudio: false,
+    check(report, output) {
+      if (report.width !== "481" || report.height !== "271") {
+        throw new Error(`expected source dims 481x271, got ${report.width}x${report.height}`);
+      }
+      requireStream(output, "codec_type=video", "width=480", "height=270");
+    },
+  },
+  {
+    // 90-degree display matrix must survive demux -> remux untouched.
+    name: "rotation",
+    file: sample("rotated.mp4"),
+    expectAudio: false,
+    check(report, output) {
+      if (!/rotation=90/.test(output)) {
+        throw new Error("output lost the 90-degree display matrix");
+      }
+    },
+  },
+  {
+    // Opus is not a legal MP4 audio codec (and the browser picked an MP4
+    // output): the run must succeed video-only with an explanatory note.
+    name: "opus in mp4",
+    file: sample("opus-in-mp4.mp4"),
+    check(report, output) {
+      if (!/cannot be stream-copied/i.test(report.audio)) {
+        throw new Error(`expected a stream-copy refusal note, got "${report.audio}"`);
+      }
+      requireNoStream(output, "codec_type=audio");
+    },
+  },
+  {
+    name: "one frame",
+    file: sample("one-frame.mp4"),
+    expectError: /fewer than two frames/,
+  },
+  {
+    name: "corrupt upload",
+    file: sample("corrupt.mp4"),
+    expectError: /Failed: .+/, // any clean pipeline/demux error (not a crash)
+  },
+  {
+    // 1700-frame clip on software codecs gives the cancel click a multi-
+    // second window; the UI must return to idle with a "Cancelled." status.
+    name: "cancel",
+    file: sample("long-boomerang.mp4"),
+    cancelAfterMs: 300,
+  },
 ];
+
+function requireStream(probeOutput, ...needles) {
+  const has = probeOutput
+    .split("\n")
+    .some((l) => /codec_type=/.test(l) && needles.every((n) => l.includes(n)));
+  if (!has) {
+    throw new Error(`ffprobe lacks a stream with all of: ${needles.join(", ")}`);
+  }
+}
+
+function requireNoStream(probeOutput, needle) {
+  const bad = probeOutput
+    .split("\n")
+    .some((l) => /codec_type=/.test(l) && l.includes(needle));
+  if (bad) throw new Error(`ffprobe unexpectedly matched ${needle}`);
+}
 
 function fail(message) {
   console.error(`FAIL: ${message}`);
@@ -158,9 +255,7 @@ try {
       () => !document.getElementById("caps").textContent.includes("Checking"),
       { timeout: 30_000 },
     );
-    console.log(`caps: ${await page.textContent("#caps")}`);
 
-    await testCase.prepare?.(page);
     if (testCase.file) {
       await page.setInputFiles("#videoFile", testCase.file);
     }
@@ -170,14 +265,44 @@ try {
     await page.waitForFunction(() => !document.getElementById("submit").disabled);
     await page.click("#submit");
 
-    // Software blend + software codec on SwiftShader: allow generous time.
+    if (testCase.cancelAfterMs) {
+      await page.waitForTimeout(testCase.cancelAfterMs);
+      await page.click("#cancel");
+    }
+
+    // Terminal states: result shown, "Failed: ...", or "Cancelled."
     await page.waitForFunction(
       () =>
         document.getElementById("result").style.display === "block" ||
-        document.getElementById("status").textContent.startsWith("Failed"),
+        document.getElementById("status").textContent.startsWith("Failed") ||
+        document.getElementById("status").textContent.startsWith("Cancelled"),
       { timeout: 240_000 },
     );
     const statusText = await page.textContent("#status");
+
+    if (testCase.cancelAfterMs) {
+      if (!statusText.startsWith("Cancelled")) {
+        fail(`${testCase.name}: expected "Cancelled.", got "${statusText}"`);
+      }
+      console.log(`ok(${testCase.name}): ${statusText}`);
+      await context.close();
+      continue;
+    }
+
+    if (testCase.expectError) {
+      if (!statusText.startsWith("Failed")) {
+        fail(`${testCase.name}: expected failure, got "${statusText}"`);
+      }
+      if (!testCase.expectError.test(statusText)) {
+        fail(
+          `${testCase.name}: "${statusText}" does not match ${testCase.expectError}`,
+        );
+      }
+      console.log(`ok(${testCase.name}): ${statusText}`);
+      await context.close();
+      continue;
+    }
+
     if (statusText.startsWith("Failed")) {
       console.log(logs.join("\n"));
       fail(`${testCase.name}: ${statusText}`);
@@ -195,21 +320,18 @@ try {
     if (testCase.expectAudio && !report.audio.startsWith("aac")) {
       fail(`${testCase.name}: expected copied aac audio, got "${report.audio}"`);
     }
-    if (!testCase.expectAudio && !report.audio.includes("no audio")) {
-      fail(`${testCase.name}: expected audio-free report, got "${report.audio}"`);
+    if (
+      testCase.expectAudio === false &&
+      !/no audio|stream copy/.test(report.audio) &&
+      !/cannot be stream-copied/i.test(report.audio)
+    ) {
+      fail(`${testCase.name}: unexpected audio report entry "${report.audio}"`);
     }
     if (parseInt(report.frames, 10) < 180) {
       fail(`${testCase.name}: only ${report.frames} frames encoded (expected ~189)`);
     }
-    if (testCase.check) {
-      try {
-        testCase.check(report);
-      } catch (err) {
-        fail(`${testCase.name}: ${err.message}`);
-      }
-    }
 
-    // Pull the produced file back out of the browser for ffprobe.
+    // Pull the produced file back out of the browser and validate it.
     const bytes = await page.evaluate(async () => {
       const response = await fetch(document.getElementById("download").href);
       const buffer = await response.arrayBuffer();
@@ -224,11 +346,24 @@ try {
     const slug = testCase.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
     const outFile = join(root, "bench", `e2e-out-${slug}.mp4`);
     writeFileSync(outFile, Buffer.from(bytes, "base64"));
-    console.log(`wrote ${outFile}`);
+    const output = probe(outFile);
+    // Mux-level sanity: ffmpeg must demux without complaints.
+    execFileSync("ffmpeg", ["-v", "error", "-i", outFile, "-f", "null", "-"]);
+    if (testCase.check) {
+      try {
+        testCase.check(report, output);
+      } catch (err) {
+        fail(`${testCase.name}: ${err.message}`);
+      }
+    }
+    console.log(`ok(${testCase.name}): ${outFile}`);
 
     await context.close();
     if (logs.some((l) => l.startsWith("[error]") || l.startsWith("[pageerror]"))) {
-      console.log("console issues:\n" + logs.filter((l) => l.startsWith("[error]") || l.startsWith("[pageerror]")).join("\n"));
+      console.log(
+        "console issues:\n" +
+          logs.filter((l) => l.startsWith("[error]") || l.startsWith("[pageerror]")).join("\n"),
+      );
     }
   }
   console.log(process.exitCode ? "E2E FAILED" : "E2E PASSED");

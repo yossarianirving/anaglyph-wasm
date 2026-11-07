@@ -398,15 +398,23 @@ export async function convertVideoToAnaglyph(options) {
         // The first chunk carries the decoder initialization config (avcC,
         // vpcC, ...); later ones need no meta.
         const isFirst = videoChunks++ === 0;
-        muxChain = muxChain.then(() =>
-          videoSource.add(packet, isFirst ? meta : undefined),
-        );
+        muxChain = muxChain
+          .then(() => videoSource.add(packet, isFirst ? meta : undefined))
+          .catch(latch);
       },
       error(e) {
         fatalError ??= e instanceof Error ? e : new Error(String(e));
       },
     });
     encoder.configure(plan.encoderConfig);
+
+    /** Latch an error from a detached chain step (never reject the chain:
+     * pending steps must still run their cleanup, and the main flow rethrows
+     * `fatalError` — a rejected chain would surface as an unhandled
+     * rejection after a cancel abandoned the awaits). */
+    const latch = (e) => {
+      fatalError ??= e instanceof Error ? e : new Error(String(e));
+    };
 
     const sourceRect =
       width === source.codedWidth && height === source.codedHeight
@@ -486,16 +494,27 @@ export async function convertVideoToAnaglyph(options) {
           colorSpace: colorSpaceInit(videoFrame.colorSpace),
           rgba: null,
         };
-        frameChain = frameChain.then(async () => {
-          entry.rgba = pool.acquire();
-          await videoFrame.copyTo(new Uint8Array(entry.rgba), {
-            format: "RGBA",
-            rect: sourceRect,
+        frameChain = frameChain
+          .then(async () => {
+            entry.rgba = pool.acquire();
+            await videoFrame.copyTo(new Uint8Array(entry.rgba), {
+              format: "RGBA",
+              rect: sourceRect,
+            });
+            videoFrame.close();
+            pendingEntries.set(entry.index, entry);
+            await handleStrategyResult(strategy.push(entry));
+          })
+          .catch((e) => {
+            // Copy failures and cancellation land here; pending steps still
+            // run (closing their VideoFrame), the main flow rethrows.
+            latch(e);
+            try {
+              videoFrame.close();
+            } catch {
+              /* already closed */
+            }
           });
-          videoFrame.close();
-          pendingEntries.set(entry.index, entry);
-          await handleStrategyResult(strategy.push(entry));
-        });
       },
       error(e) {
         fatalError ??= e instanceof Error ? e : new Error(String(e));
