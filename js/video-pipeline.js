@@ -2,16 +2,21 @@
  * Browser video -> anaglyph video pipeline: WebCodecs hardware decode/encode
  * around the wasm WebGPU blender.
  *
- *   demux (mediabunny) ──► VideoDecoder ──► pair window ──► RGBA copy
- *        │                                                      │
- *        │                                            wasm VideoBlender
- *        │                                                      │
- *   mux (mediabunny) ◄── VideoEncoder ◄── blended RGBA ◄────────┘
+ *   demux (mediabunny) ──► VideoDecoder ──► RGBA copy ──► pairing strategy
+ *        │                                                       │
+ *        │                                          wasm VideoBlender
+ *        │                                                       │
+ *   mux (mediabunny) ◄── VideoEncoder ◄── blended RGBA ◄─────────┘
  *
  * The compressed audio track is stream-copied straight from the source into
  * the output container (no decode/encode round trip) when the codec fits the
  * chosen container; otherwise the video is written without audio and the
  * reason is reported in the conversion report.
+ *
+ * Pairing (js/pairing.js) comes in two flavours: fixed eye assignment for
+ * the whole clip, or `auto`, where every frame's horizontal drift feeds the
+ * wasm `Tracker` (mirroring anaglyph-rs `Pairer::Auto`) and pairs are emitted
+ * once their trend is confirmed — swapping eyes at detected reversals.
  *
  * Timestamps inside this module are microseconds (the WebCodecs unit);
  * mediabunny packets use seconds and are converted at its boundary. All
@@ -32,7 +37,7 @@ import {
   Output,
   WebMOutputFormat,
 } from "../vendor/mediabunny.mjs";
-import { FramePairer } from "./pairing.js";
+import { createPairStrategy } from "./pairing.js";
 
 /** Encoded chunks handed to the decoder before it has drained. */
 const DECODE_QUEUE_LIMIT = 32;
@@ -210,17 +215,54 @@ function colorSpaceInit(colorSpace) {
   };
 }
 
+/** Reusable RGBA frame buffers, pooled because held frames vary with the
+ * tracker's confirmation lag (fixed pairing needs two, auto up to its
+ * `pending_cap`). */
+class BufferPool {
+  constructor(byteLength) {
+    this.byteLength = byteLength;
+    /** @type {ArrayBuffer[]} */
+    this.free = [];
+    this.held = 0;
+    this.maxHeld = 0;
+  }
+
+  acquire() {
+    const buffer = this.free.pop() ?? new ArrayBuffer(this.byteLength);
+    this.held += 1;
+    this.maxHeld = Math.max(this.maxHeld, this.held);
+    return buffer;
+  }
+
+  release(buffer) {
+    this.free.push(buffer);
+    this.held -= 1;
+  }
+}
+
+/** One-line summary of detected reversals for the report table. */
+function formatReversals(reversals) {
+  if (reversals.length === 0) return "none detected";
+  return reversals
+    .map((r) => `${r.time.toFixed(2)}s ${r.from} -> ${r.to}`)
+    .join("; ");
+}
+
 /**
  * Convert a video file into an anaglyph video.
  *
  * @param {object} options
  * @param {File | Blob} options.file Source video.
- * @param {"clockwise" | "counter-clockwise"} [options.direction] Eye pairing
- *   for the whole clip (auto direction arrives with the motion bindings).
+ * @param {"clockwise" | "counter-clockwise" | "auto" | "auto-reverse"}
+ *   [options.direction] Eye pairing; `auto` detects the orbit from image
+ *   motion (needs `createTracker`).
  * @param {string} [options.anaglyphType] wasm blend flavor name.
  * @param {(width: number, height: number, anaglyphType: string) => Promise<{blend: (left: Uint8Array, right: Uint8Array) => Promise<Uint8Array>, is_gpu: () => boolean}>} options.createBlender
  *   Factory for the wasm blender. Injected so this module stays free of the
  *   wasm import and remains runnable (with a stub blender) outside a browser.
+ * @param {(width: number, height: number, reverse: boolean) => Promise<{tracker: object, observe: (frame: object) => {dx: number, reliable: boolean}}>} [options.createTracker]
+ *   Factory for the auto-direction tracker + motion observer (wasm exports
+ *   `Tracker` and `MotionAnalyzer` in the browser; tests pass stubs).
  * @param {(status: object) => void} [options.onProgress]
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<{ blob: Blob, report: object }>}
@@ -231,6 +273,7 @@ export async function convertVideoToAnaglyph(options) {
     direction = "clockwise",
     anaglyphType = "color",
     createBlender,
+    createTracker,
     onProgress = () => {},
     signal,
   } = options;
@@ -249,8 +292,14 @@ export async function convertVideoToAnaglyph(options) {
   let decoder = null;
   /** @type {VideoEncoder | null} */
   let encoder = null;
-  /** @type {FramePairer | null} */
-  let pairer = null;
+  /** Resized once the frame dimensions are known; never acquires before. */
+  let pool = new BufferPool(0);
+  /** @type {Map<number, object>} frames whose buffer is not yet released */
+  const pendingEntries = new Map();
+  /** @type {object[]} reversals confirmed during the run (auto mode) */
+  const reversalsFound = [];
+  /** 0-based index of the next decoded frame (the tracker's frame index). */
+  let nextFrameIndex = 0;
 
   try {
     // Prefer a hardware decoder, but fall back to letting the browser pick
@@ -287,6 +336,18 @@ export async function convertVideoToAnaglyph(options) {
     const audio = planAudioCopy(source.audioCodec, plan.container);
 
     const blender = await createBlender(width, height, anaglyphType);
+    pool = new BufferPool(width * height * 4);
+
+    let strategy;
+    if (direction === "auto" || direction === "auto-reverse") {
+      if (!createTracker) {
+        throw new PipelineError(`direction "${direction}" needs a tracker factory`);
+      }
+      const auto = await createTracker(width, height, direction === "auto-reverse");
+      strategy = createPairStrategy(direction, auto);
+    } else {
+      strategy = createPairStrategy(direction);
+    }
 
     // ---- Output: muxer with compressed packet sources ----
     const output = new Output({ format: plan.format, target: new BufferTarget() });
@@ -347,32 +408,18 @@ export async function convertVideoToAnaglyph(options) {
     });
     encoder.configure(plan.encoderConfig);
 
-    pairer = new FramePairer(direction);
-    // Ping-pong RGBA buffers: processing is strictly sequential (frameChain),
-    // and both slots are rewritten from live VideoFrames before each blend,
-    // so two buffers cover the two-frame pairing window.
-    const buffers = [
-      new ArrayBuffer(width * height * 4),
-      new ArrayBuffer(width * height * 4),
-    ];
-    let slot = 0;
     const sourceRect =
       width === source.codedWidth && height === source.codedHeight
         ? undefined
         : { x: 0, y: 0, width, height };
 
-    async function processPair(pair) {
-      const left = new Uint8Array(buffers[slot]);
-      slot ^= 1;
-      const right = new Uint8Array(buffers[slot]);
-      await pair.left.frame.copyTo(left, { format: "RGBA", rect: sourceRect });
-      await pair.right.frame.copyTo(right, { format: "RGBA", rect: sourceRect });
-      const colorSpace =
-        colorSpaceInit(pair.left.frame.colorSpace) ??
-        colorSpaceInit(pair.right.frame.colorSpace);
-
+    /** Blend an already-paired pair (owned RGBA buffers) and encode it. */
+    async function emitPair(pair) {
       t0Us ??= pair.timestamp;
-      const blended = await blender.blend(left, right);
+      const blended = await blender.blend(
+        new Uint8Array(pair.left.rgba),
+        new Uint8Array(pair.right.rgba),
+      );
 
       await drainQueue(encoder, "encodeQueueSize", ENCODE_QUEUE_LIMIT);
       checkAbort();
@@ -383,13 +430,31 @@ export async function convertVideoToAnaglyph(options) {
         timestamp: pair.timestamp - t0Us,
         duration: pair.duration > 0 ? pair.duration : fallbackDurationUs,
         alphaMode: "discard",
-        colorSpace,
+        colorSpace: pair.left.colorSpace ?? pair.right.colorSpace,
       });
       encoder.encode(outFrame, { keyFrame: pairCount % keyframeEvery === 0 });
       outFrame.close();
       pairCount += 1;
 
       if (pairCount % 10 === 0) reportProgress();
+    }
+
+    /** Drain what the strategy just confirmed, then recycle spent buffers. */
+    async function handleStrategyResult(result) {
+      if (result.reversals.length > 0) {
+        reversalsFound.push(...result.reversals);
+      }
+      for (const pair of result.pairs) {
+        await emitPair(pair);
+      }
+      if (result.releasedBefore >= 0) {
+        for (const [index, entry] of pendingEntries) {
+          if (index >= result.releasedBefore) break; // insertion == index order
+          pool.release(entry.rgba);
+          entry.rgba = null;
+          pendingEntries.delete(index);
+        }
+      }
     }
 
     function reportProgress() {
@@ -402,36 +467,35 @@ export async function convertVideoToAnaglyph(options) {
           : null,
         fps: elapsed > 0 ? pairCount / elapsed : 0,
         gpuBlend: blender.is_gpu(),
+        auto: strategy.auto,
+        reversals: reversalsFound.length,
       });
     }
 
     decoder = new VideoDecoder({
       output(videoFrame) {
-        // FramePairer keeps the previous entry; each completed pair carries
-        // both frame entries. The left one is closed once blended; the right
-        // one stays held by the pairer as the next pair's left (and closes
-        // with it, or in the finally block at end of stream).
+        // Every frame is copied to an owned RGBA buffer immediately and the
+        // VideoFrame closed: held-back (auto) frames would otherwise pin
+        // decoder-owned memory, and motion analysis + blending both need
+        // dense pixels. All processing runs serialized on frameChain, so a
+        // frame's buffer always outlives the pairs that reference it.
         const entry = {
-          frame: videoFrame,
+          index: nextFrameIndex++,
           timestamp: videoFrame.timestamp,
           duration: videoFrame.duration ?? 0,
+          colorSpace: colorSpaceInit(videoFrame.colorSpace),
+          rgba: null,
         };
-        const pair = pairer.push(entry);
-        if (!pair) return;
-        frameChain = frameChain
-          .then(() => processPair(pair))
-          .finally(() => {
-            // The pairer's window keeps only the two most recent frames, so
-            // once this pair is blended the older frame is never used again
-            // (the newer one stays as the next pair's older side). Closing
-            // the wrong one breaks the next pair: it is still referenced.
-            const older = pair.left === entry ? pair.right : pair.left;
-            try {
-              older.frame.close();
-            } catch {
-              /* already closed */
-            }
+        frameChain = frameChain.then(async () => {
+          entry.rgba = pool.acquire();
+          await videoFrame.copyTo(new Uint8Array(entry.rgba), {
+            format: "RGBA",
+            rect: sourceRect,
           });
+          videoFrame.close();
+          pendingEntries.set(entry.index, entry);
+          await handleStrategyResult(strategy.push(entry));
+        });
       },
       error(e) {
         fatalError ??= e instanceof Error ? e : new Error(String(e));
@@ -451,8 +515,10 @@ export async function convertVideoToAnaglyph(options) {
     await frameChain;
     if (fatalError) throw fatalError;
 
-    // The last frame never completed a pair; it is not encoded (the native
-    // pipeline also emits N-1 frames for N inputs).
+    // End of stream: the strategy commits every held-back pair (the last
+    // frame never pairs; like the native pipeline, N inputs give N-1 pairs).
+    await handleStrategyResult(strategy.flush());
+
     if (pairCount === 0) {
       throw new PipelineError(
         "video has fewer than two frames; anaglyph conversion needs at least one frame pair",
@@ -498,13 +564,20 @@ export async function convertVideoToAnaglyph(options) {
         })`,
         decoder: `${source.codecString} (${decoderMode})`,
         blender: blender.is_gpu() ? "WebGPU" : "CPU (fallback)",
+        direction: strategy.auto
+          ? direction === "auto-reverse"
+            ? "auto (reversed)"
+            : "auto"
+          : direction,
+        reversals: strategy.auto ? formatReversals(reversalsFound) : "n/a",
         audio: audioNote ?? "none",
         width: source.codedWidth,
         height: source.codedHeight,
+        frameBuffers: pool.maxHeld,
       },
     };
   } finally {
-    // Release codec and frame resources on every exit path (success, error,
+    // Release codec and buffer resources on every exit path (success, error,
     // cancel). close() on an already-closed codec throws; ignore.
     for (const codec of [decoder, encoder]) {
       try {
@@ -513,12 +586,10 @@ export async function convertVideoToAnaglyph(options) {
         /* already closed */
       }
     }
-    try {
-      // The final frame never completed a pair; release it here.
-      pairer?.held()?.frame.close();
-    } catch {
-      /* already closed */
+    for (const entry of pendingEntries.values()) {
+      if (entry.rgba) pool.release(entry.rgba);
     }
+    pendingEntries.clear();
     source.input.dispose();
   }
 }

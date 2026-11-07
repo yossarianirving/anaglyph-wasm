@@ -21,6 +21,8 @@
                 "360 booth" clip (camera orbiting a mostly static subject).
                 H.264 input in MP4 works best; AAC audio is stream-copied
                 into the output, other audio codecs are dropped with a note.
+                "Auto" direction detects the orbit from the image motion and
+                swaps eyes when the booth reverses.
             </p>
 
             <div id="caps" class="alert alert-secondary py-2">
@@ -54,6 +56,12 @@
                             <option value="clockwise">Clockwise</option>
                             <option value="counter-clockwise">
                                 Counter-Clockwise
+                            </option>
+                            <option value="auto">
+                                Auto (detect from motion)
+                            </option>
+                            <option value="auto-reverse">
+                                Auto, swapped eyes
                             </option>
                         </select>
                     </div>
@@ -174,7 +182,10 @@
                         " frames  ·  " +
                         s.fps.toFixed(1) +
                         " fps  ·  blend: " +
-                        (s.gpuBlend ? "WebGPU" : "CPU"),
+                        (s.gpuBlend ? "WebGPU" : "CPU") +
+                        (s.auto && s.reversals
+                            ? "  ·  reversals: " + s.reversals
+                            : ""),
                 );
             }
 

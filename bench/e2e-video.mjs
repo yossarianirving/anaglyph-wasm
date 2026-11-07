@@ -40,6 +40,61 @@ const CASES = [
     file: join(root, "bench", "booth2s-aac.mp4"),
     expectAudio: true,
   },
+  {
+    // Forward + reverse concat: exactly one reversal, verified against the
+    // native CLI:
+    //   anaglyph-rs --video bench/boomerang.mp4 -d auto
+    //   -> "reversal at 5.67s (frame 190): counter-clockwise -> clockwise"
+    name: "boomerang auto",
+    file: join(root, "bench", "boomerang.mp4"),
+    direction: "auto",
+    expectAudio: false,
+    check(report) {
+      if (report.direction !== "auto") {
+        throw new Error(`expected auto direction, got "${report.direction}"`);
+      }
+      const reversals =
+        report.reversals === "none detected"
+          ? []
+          : report.reversals.split("; ");
+      if (reversals.length !== 1) {
+        throw new Error(
+          `expected exactly 1 reversal (native CLI reference), got ${reversals.length}: "${report.reversals}"`,
+        );
+      }
+      if (!/counter-clockwise -> clockwise/.test(reversals[0])) {
+        throw new Error(
+          `reversal direction mismatch, got "${reversals[0]}" (native: counter-clockwise -> clockwise at 5.67s)`,
+        );
+      }
+      const seconds = Number(/([0-9.]+)s/.exec(reversals[0])?.[1]);
+      if (!(Math.abs(seconds - 5.67) <= 0.1)) {
+        throw new Error(
+          `reversal time ${seconds}s deviates from native reference 5.67s`,
+        );
+      }
+    },
+  },
+  {
+    // Same clip with the eyes swapped: native `-d auto-reverse` reports the
+    // mirrored reversal "clockwise -> counter-clockwise".
+    name: "boomerang auto-reverse",
+    file: join(root, "bench", "boomerang.mp4"),
+    direction: "auto-reverse",
+    expectAudio: false,
+    check(report) {
+      if (report.direction !== "auto (reversed)") {
+        throw new Error(
+          `expected "auto (reversed)" direction label, got "${report.direction}"`,
+        );
+      }
+      if (!/^5\.6\d+s clockwise -> counter-clockwise$/.test(report.reversals)) {
+        throw new Error(
+          `expected mirrored reversal at ~5.67s, got "${report.reversals}"`,
+        );
+      }
+    },
+  },
 ];
 
 function fail(message) {
@@ -109,6 +164,9 @@ try {
     if (testCase.file) {
       await page.setInputFiles("#videoFile", testCase.file);
     }
+    if (testCase.direction) {
+      await page.selectOption("#videoDirection", testCase.direction);
+    }
     await page.waitForFunction(() => !document.getElementById("submit").disabled);
     await page.click("#submit");
 
@@ -143,6 +201,13 @@ try {
     if (parseInt(report.frames, 10) < 180) {
       fail(`${testCase.name}: only ${report.frames} frames encoded (expected ~189)`);
     }
+    if (testCase.check) {
+      try {
+        testCase.check(report);
+      } catch (err) {
+        fail(`${testCase.name}: ${err.message}`);
+      }
+    }
 
     // Pull the produced file back out of the browser for ffprobe.
     const bytes = await page.evaluate(async () => {
@@ -156,7 +221,8 @@ try {
       }
       return btoa(binary);
     });
-    const outFile = join(root, "bench", `e2e-out-${testCase.expectAudio ? "aac" : "silent"}.mp4`);
+    const slug = testCase.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    const outFile = join(root, "bench", `e2e-out-${slug}.mp4`);
     writeFileSync(outFile, Buffer.from(bytes, "base64"));
     console.log(`wrote ${outFile}`);
 

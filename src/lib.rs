@@ -346,3 +346,154 @@ fn cpu_blend_rgba(left: &[u8], right: &[u8], matrix: &[[f32; 9]; 2]) -> Vec<u8> 
     }
     out
 }
+
+#[cfg(target_arch = "wasm32")]
+use anaglyph_rs::motion::{trend_to_direction, MotionSample};
+
+/// Per-frame camera drift estimator for auto-direction pairing. Wraps the
+/// native `MotionEstimator` and consumes the same dense RGBA frames the
+/// pipeline already produces for [`VideoBlender`], so decoded frames feed
+/// motion analysis without a separate format conversion on the JS side.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct MotionAnalyzer {
+    inner: anaglyph_rs::motion::MotionEstimator,
+    /// Reusable dense RGB24 buffer; the estimator expects RGB24.
+    rgb: Vec<u8>,
+    frame_len: usize,
+    last_reliable: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl MotionAnalyzer {
+    /// New estimator for `width` x `height` frames. Every
+    /// [`Self::observe_rgba`] call must supply exactly `width * height * 4`
+    /// bytes.
+    pub fn new(width: u32, height: u32) -> Result<MotionAnalyzer, JsValue> {
+        let rgb_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|p| p.checked_mul(3))
+            .ok_or_else(|| JsValue::from_str("frame dimensions overflow"))?;
+        Ok(MotionAnalyzer {
+            inner: anaglyph_rs::motion::MotionEstimator::new(width as usize, height as usize),
+            rgb: vec![0; rgb_len],
+            frame_len: rgb_len / 3 * 4,
+            last_reliable: false,
+        })
+    }
+
+    /// Match the next frame (dense RGBA) against its predecessor and return
+    /// the signed horizontal drift in source pixels per frame, positive when
+    /// the image content moves right. Check [`Self::is_reliable`] before
+    /// trusting the value.
+    pub fn observe_rgba(&mut self, rgba: &[u8]) -> Result<f32, JsValue> {
+        if rgba.len() != self.frame_len {
+            return Err(JsValue::from_str(
+                "frame size mismatch: expected width*height*4 bytes",
+            ));
+        }
+        let mut j = 0;
+        for chunk in rgba.chunks_exact(4) {
+            self.rgb[j..j + 3].copy_from_slice(&chunk[..3]);
+            j += 3;
+        }
+        let sample = self.inner.observe(&self.rgb);
+        self.last_reliable = sample.reliable;
+        Ok(sample.dx)
+    }
+
+    /// Whether the last [`Self::observe_rgba`] sample was trustworthy
+    /// (false: scene cut, motion beyond the search range, textureless input,
+    /// or the very first frame).
+    pub fn is_reliable(&self) -> bool {
+        self.last_reliable
+    }
+}
+
+/// Camera orbit direction tracker for `direction: "auto"`: wraps the native
+/// [`anaglyph_rs::motion::DirectionTracker`] and exposes the trend-to-eye-
+/// pairing mapping, so the JS pairing window gates and labels its output
+/// exactly like the native CLI's auto mode.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct Tracker {
+    inner: anaglyph_rs::motion::DirectionTracker,
+    reverse: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl Tracker {
+    /// `reverse` flips the detected pairing, for rigs whose physical
+    /// rotation runs opposite to the convention (the CLI's `auto-reverse`).
+    #[wasm_bindgen(constructor)]
+    pub fn new(reverse: bool) -> Tracker {
+        Tracker {
+            inner: anaglyph_rs::motion::DirectionTracker::new(Default::default()),
+            reverse,
+        }
+    }
+
+    /// Record the drift sample of frame `index` (0-based decode order) at
+    /// `time_secs` (source presentation time, seconds).
+    pub fn push(&mut self, index: usize, time_secs: f64, dx: f32, reliable: bool) {
+        self.inner.push(index, time_secs, &MotionSample { dx, reliable });
+    }
+
+    /// Highest frame index whose pairing can no longer change; pairs whose
+    /// newer frame is at or below it may be emitted. `-1` while nothing is
+    /// confirmed yet.
+    pub fn confirmed_through(&self) -> f64 {
+        self.inner.confirmed_through().map_or(-1.0, |c| c as f64)
+    }
+
+    /// Eye pairing for the frames following `confirmed_through()`, as
+    /// `"clockwise"` or `"counter-clockwise"` (the un-reversed base pairing
+    /// while no trend has formed).
+    pub fn current_direction(&self) -> String {
+        direction_name(trend_to_direction(self.inner.current_trend(), self.reverse))
+    }
+
+    /// End of stream: everything held back commits to the current trend.
+    pub fn finish(&mut self) {
+        self.inner.finish();
+    }
+
+    /// Drain the reversals confirmed since the last call, packed as f64
+    /// quads `[frame, time_secs, from_clockwise, to_clockwise]` with the
+    /// direction slots 1 for clockwise, 0 for counter-clockwise (already
+    /// mapped through `reverse`).
+    pub fn take_reversals(&mut self) -> Vec<f64> {
+        let mut out = Vec::new();
+        for r in self.inner.take_reversals() {
+            out.push(r.frame as f64);
+            out.push(r.time);
+            out.push(direction_bit(trend_to_direction(
+                Some(r.from),
+                self.reverse,
+            )));
+            out.push(direction_bit(trend_to_direction(
+                Some(r.to),
+                self.reverse,
+            )));
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn direction_name(direction: VideoDirection) -> String {
+    match direction {
+        VideoDirection::Clockwise => "clockwise".to_string(),
+        VideoDirection::CounterClockwise => "counter-clockwise".to_string(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn direction_bit(direction: VideoDirection) -> f64 {
+    match direction {
+        VideoDirection::Clockwise => 1.0,
+        VideoDirection::CounterClockwise => 0.0,
+    }
+}

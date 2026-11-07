@@ -1,4 +1,4 @@
-import init, { VideoBlender } from "./pkg/anaglyph_wasm.js";
+import init, { MotionAnalyzer, Tracker, VideoBlender } from "./pkg/anaglyph_wasm.js";
 import { convertVideoToAnaglyph } from "./js/video-pipeline.js";
 
 /** @type {AbortController | null} */
@@ -41,6 +41,26 @@ async function startConversion(data) {
       // wasm-bindgen static async factory (async ctors are deprecated).
       createBlender: (width, height, anaglyphType) =>
         VideoBlender.new(width, height, anaglyphType),
+      createTracker: async (width, height, reverse) => {
+        // wasm-bindgen keeps Rust snake_case on the JS surface; pairing.js
+        // speaks camelCase, so adapt here (the glue layer owns wasm shapes).
+        const analyzer = MotionAnalyzer.new(width, height);
+        const tracker = new Tracker(reverse);
+        return {
+          tracker: {
+            push: (index, timeSecs, dx, reliable) =>
+              tracker.push(index, timeSecs, dx, reliable),
+            confirmedThrough: () => tracker.confirmed_through(),
+            currentDirection: () => tracker.current_direction(),
+            finish: () => tracker.finish(),
+            takeReversals: () => tracker.take_reversals(),
+          },
+          observe: (frame) => ({
+            dx: analyzer.observe_rgba(new Uint8Array(frame.rgba)),
+            reliable: analyzer.is_reliable(),
+          }),
+        };
+      },
       onProgress: (status) => postMessage({ type: "video-progress", ...status }),
       signal: controller.signal,
     });
