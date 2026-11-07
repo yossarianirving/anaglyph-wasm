@@ -38,9 +38,11 @@ async function startConversion(data) {
       file: data.file,
       direction: data.direction,
       anaglyphType: data.anaglyphType,
+      acceleration: data.acceleration,
       // wasm-bindgen static async factory (async ctors are deprecated).
-      createBlender: (width, height, anaglyphType) =>
-        VideoBlender.new(width, height, anaglyphType),
+      // `backend` is "cpu" when the WebGPU blend toggle is off.
+      createBlender: (width, height, anaglyphType, backend) =>
+        VideoBlender.new(width, height, anaglyphType, backend ?? null),
       createTracker: async (width, height, reverse) => {
         // wasm-bindgen keeps Rust snake_case on the JS surface; pairing.js
         // speaks camelCase, so adapt here (the glue layer owns wasm shapes).
