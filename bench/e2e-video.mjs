@@ -246,9 +246,13 @@ const CASES = [
   {
     // 1700-frame clip on software codecs gives the cancel click a multi-
     // second window; the UI must return to idle with a "Cancelled." status.
+    // Then a second conversion must complete in the SAME page: the reported
+    // iOS/WebKit bug was the worker keeping its busy guard after a cancel,
+    // deadlocking the page until reload.
     name: "cancel",
     file: sample("long-boomerang.mp4"),
     cancelAfterMs: 300,
+    thenRecover: sample("booth2s.mp4"),
   },
 ];
 
@@ -369,7 +373,28 @@ try {
       if (!statusText.startsWith("Cancelled")) {
         fail(`${testCase.name}: expected "Cancelled.", got "${statusText}"`);
       }
-      console.log(`ok(${testCase.name}): ${statusText}`);
+      if (testCase.thenRecover) {
+        // Same-page recovery: pick another clip and convert again.
+        await page.setInputFiles("#videoFile", testCase.thenRecover);
+        await page.waitForFunction(() => !document.getElementById("submit").disabled, {
+          timeout: 5_000,
+        });
+        await page.click("#submit");
+        await page.waitForFunction(
+          () =>
+            document.getElementById("result").style.display === "block" ||
+            document.getElementById("status").textContent.startsWith("Failed") ||
+            document.getElementById("status").textContent.startsWith("Cancelled"),
+          { timeout: 240_000 },
+        );
+        const recovered = await page.textContent("#status");
+        if (!recovered.startsWith("Done")) {
+          fail(`${testCase.name}: page did not recover after cancel, got "${recovered}"`);
+        }
+        console.log(`ok(${testCase.name}): ${statusText} then recover Done`);
+      } else {
+        console.log(`ok(${testCase.name}): ${statusText}`);
+      }
       await context.close();
       continue;
     }

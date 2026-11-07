@@ -118,9 +118,8 @@
                         hardware one looks broken (wrong colors, stalls).
                         WebGPU blending is off by default: frames must cross
                         CPU memory for decode and encode anyway, so the GPU
-                        blend round-trip usually makes things
-                        &mdash;not faster. Compare both via the fps in the
-                        report.
+                        blend round-trip usually makes things slower, not
+                        faster. Compare both via the fps in the report.
                     </div>
                 </div>
 
@@ -176,6 +175,7 @@
             var worker = new Worker("video-worker.js", { type: "module" });
             var pickedFile = null;
             var objectUrl = null;
+            var cancelWatchdog = null;
 
             var submit = document.getElementById("submit");
             var cancel = document.getElementById("cancel");
@@ -183,26 +183,71 @@
             var progressBar = document.getElementById("progressBar");
             var statusEl = document.getElementById("status");
 
+            /**
+             * Tear down and rebuild the worker. The last-resort recovery for
+             * a conversion that refused to die: WebCodecs teardown differs
+             * per engine, and a worker stuck awaiting a never-settling codec
+             * promise would otherwise hold the busy guard forever ("cancel
+             * works but the page is dead until reload"). Terminating is the
+             * one operation no engine can ignore.
+             */
+            function recreateWorker() {
+                if (worker) worker.terminate();
+                worker = new Worker("video-worker.js", { type: "module" });
+            }
+
             worker.onmessage = function (e) {
                 switch (e.data.type) {
                     case "video-progress":
+                        if (cancelWatchdog) {
+                            clearTimeout(cancelWatchdog);
+                            cancelWatchdog = null;
+                        }
                         setProgress(e.data);
                         break;
                     case "video-result":
+                        if (cancelWatchdog) {
+                            clearTimeout(cancelWatchdog);
+                            cancelWatchdog = null;
+                        }
                         showResult(e.data.url, e.data.report);
                         setBusy(false);
                         break;
                     case "video-cancelled":
+                        if (cancelWatchdog) {
+                            clearTimeout(cancelWatchdog);
+                            cancelWatchdog = null;
+                        }
                         setStatus("Cancelled.");
                         setBusy(false);
                         break;
                     case "anaglyph-error":
+                        if (cancelWatchdog) {
+                            clearTimeout(cancelWatchdog);
+                            cancelWatchdog = null;
+                        }
                         setStatus("Failed: " + e.data.message);
                         setBusy(false);
                         break;
                     default:
                         break;
                 }
+            };
+
+            // A worker that dies outside the message protocol (uncaught
+            // exception) would otherwise leave the page busy forever.
+            worker.onerror = function (e) {
+                if (cancelWatchdog) {
+                    clearTimeout(cancelWatchdog);
+                    cancelWatchdog = null;
+                }
+                setStatus(
+                    "Failed: worker error" +
+                        (e.message ? " — " + e.message : "") +
+                        ". You can try again.",
+                );
+                recreateWorker();
+                setBusy(false);
             };
 
             function setStatus(text) {
@@ -279,13 +324,19 @@
                 .getElementById("useSample")
                 .addEventListener("click", async function () {
                     setStatus("Loading sample clip…");
-                    var response = await fetch("bench/booth2s.mp4");
+                    // ?sample=<same-origin path> overrides the bundled clip
+                    // (tests use the longer bench fixture to test cancelling).
+                    var samplePath =
+                        new URLSearchParams(location.search).get("sample") ||
+                        "bench/booth2s.mp4";
+                    var response = await fetch(samplePath);
                     if (!response.ok) {
                         setStatus("Could not load the sample clip.");
                         return;
                     }
                     var blob = await response.blob();
-                    setFile(new File([blob], "booth2s.mp4", { type: blob.type }));
+                    var name = samplePath.split("/").pop();
+                    setFile(new File([blob], name, { type: blob.type }));
                 });
 
             document
@@ -312,6 +363,22 @@
             cancel.addEventListener("click", function () {
                 setStatus("Cancelling…");
                 worker.postMessage({ type: "cancel-video" });
+                // Grace period for the cooperative cancel (the pipeline
+                // aborts its awaits, the worker replies). Some engines can
+                // strand a codec await past the abort; if no reply arrives,
+                // force-reset the worker so the page never stays busy.
+                if (cancelWatchdog) clearTimeout(cancelWatchdog);
+                var name = pickedFile && pickedFile.name;
+                cancelWatchdog = setTimeout(function () {
+                    cancelWatchdog = null;
+                    recreateWorker();
+                    setStatus(
+                        "Cancelled. The stuck worker was reset" +
+                            (name ? "; pick \u201c" + name + "\u201d again" : "") +
+                            ".",
+                    );
+                    setBusy(false);
+                }, 1500);
             });
 
             // Capability banner: WebCodecs + WebGPU are both required for the

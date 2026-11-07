@@ -134,6 +134,31 @@ Native CLI (`-b cpu`, VAAPI h264 encode, wall-clock incl. process start):
 Native runs on 5-second clips are dominated by process/encoder startup;
 the 11-second boomerang shows the steady state (~1200 frames/s).
 
+## Engine notes (WebKit / Safari / iOS)
+
+Verified against WebKitGTK 2.54.2 (GNOME Web, driven by
+`bench/e2e-webkit.mjs` — same engine family as iOS Safari):
+
+- **`VideoFrame.copyTo` ignores `format`**: an "RGBA" copy returns the
+  frame's native NV12/I420 planes (and a non-spec `[{offset, stride}]`
+  return value). Reading that as RGBA produced the garbled gray output on
+  iOS. The pipeline probes one frame (`detectCopyMode`) and falls back to
+  `createImageBitmap` + `OffscreenCanvas` raster (`frameCopy: "canvas
+  raster"` in the report) — ~259 pairs/s on WebKitGTK vs ~1200 on headless
+  Chromium, both CPU-blend.
+- **Color space**: WebKit reports `primaries: "unspecified"` (non-spec) and
+  echoes it into the encoder's first-chunk metadata; mediabunny rejects it.
+  `colorSpaceInit`/`sanitizeChunkMeta` gate both paths to muxable values.
+- **No WebGPU**: the blender always reports CPU fallback there, consistent
+  with the new off-by-default.
+
+Cancellation is raced (`withAbort`) against every codec await
+(`flush()`, `dequeue` waits, `frameChain`, `muxChain`) because engines may
+never settle these after teardown; `video.html` additionally force-resets
+the worker 1.5 s after a cancel that produces no reply, so the page can
+never stay busy until reload. `bench/e2e-video.mjs` (Chromium) and
+`bench/e2e-webkit.mjs` both cover cancel-then-convert-again.
+
 ## Clips
 
 | file | content | why |

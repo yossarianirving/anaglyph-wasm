@@ -232,15 +232,115 @@ function planAudioCopy(audioCodec, container) {
 /**
  * Copy a VideoColorSpace into a plain VideoColorSpaceInit. The WebIDL
  * properties live on the prototype, so an object spread would yield `{}`.
+ *
+ * Sanitized: WebKit reports `primaries: "unspecified"` for SPSes without
+ * colour metadata (not a legal VideoColorPrimaries), and the value echoes
+ * through the encoder's first-chunk metadata into the muxer, where
+ * mediabunny rejects it. A colorSpace is only passed through when all
+ * three fields are concrete and inside the sets the muxer can write into
+ * colr boxes; otherwise the encoder's own default (bt709) is used.
  */
+const MULTIPLEXABLE_COLOR_SPACE = {
+  primaries: new Set(["bt709", "bt470bg", "smpte170m", "bt2020", "smpte432"]),
+  transfer: new Set(["bt709", "smpte170m", "linear", "iec61966-2-1", "pq", "hlg"]),
+  matrix: new Set(["rgb", "bt709", "bt470bg", "smpte170m", "bt2020-ncl"]),
+};
+
+function isMultiplexableColorSpace(colorSpace) {
+  return (
+    !!colorSpace &&
+    MULTIPLEXABLE_COLOR_SPACE.primaries.has(colorSpace.primaries) &&
+    MULTIPLEXABLE_COLOR_SPACE.transfer.has(colorSpace.transfer) &&
+    MULTIPLEXABLE_COLOR_SPACE.matrix.has(colorSpace.matrix)
+  );
+}
+
+/**
+ * Same sanitization applied to the encoder's first-chunk metadata before
+ * handing it to mediabunny: an encoder that echoes an unsupported
+ * colorSpace (older WebKit did) must not poison the muxer. Dropping the
+ * colorSpace leaves the container's untagged default, never a crash.
+ */
+function sanitizeChunkMeta(meta) {
+  const cs = meta?.decoderConfig?.colorSpace;
+  if (!cs || isMultiplexableColorSpace(cs)) return meta;
+  const { colorSpace, ...decoderConfig } = meta.decoderConfig;
+  return { ...meta, decoderConfig };
+}
+
 function colorSpaceInit(colorSpace) {
-  if (!colorSpace) return undefined;
+  if (!isMultiplexableColorSpace(colorSpace)) return undefined;
   return {
     primaries: colorSpace.primaries,
     transfer: colorSpace.transfer,
     matrix: colorSpace.matrix,
     fullRange: colorSpace.fullRange,
   };
+}
+
+/**
+ * Decide once, per conversion, how decoded frames become dense RGBA:
+ *
+ * - `"copyTo"` — the browser implements spec `copyTo` conversion to RGBA
+ *   (Chromium, modern Firefox).
+ * - `"canvas"` — rasterize through `createImageBitmap` + `OffscreenCanvas`.
+ *   WebKit (Safari, iOS, WebKitGTK) ignores `copyTo`'s `format` and hands
+ *   back the frame's native NV12/I420 planes (with a non-standard
+ *   `[{offset, stride}]` return); reading those as RGBA is the garbled
+ *   gray output iOS users saw.
+ *
+ * Detection probes a 4x2 region: the return must report exactly
+ * `4*4*2` bytes and the first pixel's alpha lane must be 255 — raw luma
+ * planes fail both.
+ */
+async function detectCopyMode(videoFrame) {
+  if (typeof videoFrame.copyTo !== "function") return "canvas";
+  try {
+    const probe = new Uint8Array(4 * 2 * 4);
+    const written = await videoFrame.copyTo(probe, {
+      format: "RGBA",
+      rect: { x: 0, y: 0, width: 4, height: 2 },
+    });
+    const bytes = typeof written === "number" ? written : written?.bytesWritten;
+    if (bytes !== undefined && bytes !== probe.byteLength) return "canvas";
+    // An opaque decoded frame converted to RGBA has alpha 255; NV12 bytes
+    // dumped raw put luma/chroma values there instead.
+    if (probe[3] !== 255) return "canvas";
+    return "copyTo";
+  } catch {
+    return "canvas";
+  }
+}
+
+/**
+ * Canvas fallback for `copyTo`: rasterize the frame into a persistent
+ * `willReadFrequently` 2D context and read dense RGBA into `target` (the
+ * frame's pooled buffer). Works in workers, which the pipeline runs in,
+ * and performs the YUV→sRGB conversion a spec `copyTo` would do.
+ *
+ * `rect` is relative to the frame's visible rect (same convention as
+ * `copyTo`). `createImageBitmap(VideoFrame)` may hand back the coded or
+ * the visible region depending on the engine; the crop origin is anchored
+ * accordingly so both pick the same pixels.
+ */
+async function extractViaCanvas(videoFrame, target, ctx, rect) {
+  const bitmap = await createImageBitmap(videoFrame);
+  const vis = videoFrame.visibleRect;
+  const dx = bitmap.width === videoFrame.codedWidth ? (vis?.x ?? 0) : 0;
+  const dy = bitmap.height === videoFrame.codedHeight ? (vis?.y ?? 0) : 0;
+  ctx.drawImage(
+    bitmap,
+    dx + rect.x,
+    dy + rect.y,
+    rect.width,
+    rect.height,
+    0,
+    0,
+    rect.width,
+    rect.height,
+  );
+  bitmap.close?.();
+  target.set(ctx.getImageData(0, 0, rect.width, rect.height).data);
 }
 
 /** Reusable RGBA frame buffers, pooled because held frames vary with the
@@ -349,6 +449,37 @@ export async function convertVideoToAnaglyph(options) {
     }
   };
 
+  /**
+   * Rejection that fires the instant the signal aborts (pre-fired when it
+   * already has). The no-op catch marks it as handled so runs that never
+   * await it — every run that finishes normally — do not surface an
+   * unhandled-rejection warning.
+   */
+  const abortRace = new Promise((_, reject) => {
+    const abort = () => {
+      const error = new Error("conversion cancelled");
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (signal) {
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    }
+  });
+  abortRace.catch(() => {});
+
+  /**
+   * Await `op`, but bail out as soon as the run is cancelled. WebCodecs
+   * awaits (`flush()`, a `dequeue` listener, a detached `copyTo`) may never
+   * settle once the codecs are torn down — an engine-dependent hazard seen
+   * on WebKit-family browsers — and a never-settling await here would strand
+   * the caller (and the worker's busy guard) forever: the reported "cancel
+   * works but the page is dead until reload" bug. Racing makes cancellation
+   * deterministic; the finally block still closes every codec.
+   */
+  const withAbort = (op) =>
+    signal ? Promise.race([op instanceof Promise ? op : Promise.resolve(op), abortRace]) : op;
+
   const source = await inspectSource(file);
   /** @type {VideoDecoder | null} */
   let decoder = null;
@@ -408,7 +539,9 @@ export async function convertVideoToAnaglyph(options) {
      * @typedef {object} PipelineCore
      * @property {number} width
      * @property {number} height
-     * @property {{ x: number, y: number, width: number, height: number }|undefined} sourceRect
+     * @property {{ x: number, y: number, width: number, height: number }} copyRect
+     * @property {"copyTo" | "canvas"} copyMode
+     * @property {OffscreenCanvasRenderingContext2D|null} copyCtx
      * @property {{ blend: Function, is_gpu: () => boolean }} blender
      * @property {object} strategy
      * @property {object} plan
@@ -484,6 +617,23 @@ export async function convertVideoToAnaglyph(options) {
         rotationNote = `${srcRot}\u00b0 (container) on ${videoFrame.codedWidth}\u00d7${videoFrame.codedHeight} frames`;
       }
 
+      // How do decoded frames become dense RGBA in this browser? WebKit
+      // silently hands back raw NV12/I420 planes for a "RGBA" copyTo; the
+      // probe catches that and every frame then goes through the canvas
+      // raster path instead. See detectCopyMode().
+      const copyMode = await detectCopyMode(videoFrame);
+      let copyCtx = null;
+      if (copyMode === "canvas") {
+        if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap !== "function") {
+          throw new PipelineError(
+            "this browser cannot convert decoded video frames to RGBA (no copyTo conversion, no OffscreenCanvas)",
+          );
+        }
+        copyCtx = new OffscreenCanvas(width, height).getContext("2d", {
+          willReadFrequently: true,
+        });
+      }
+
       const plan = await planEncoder(
         width,
         height,
@@ -525,8 +675,9 @@ export async function convertVideoToAnaglyph(options) {
           // The first chunk carries the decoder initialization config (avcC,
           // vpcC, ...); later ones need no meta.
           const isFirst = videoChunks++ === 0;
+          const safeMeta = isFirst ? sanitizeChunkMeta(meta) : undefined;
           muxChain = muxChain
-            .then(() => videoSource.add(packet, isFirst ? meta : undefined))
+            .then(() => videoSource.add(packet, safeMeta))
             .catch(latch);
         },
         error(e) {
@@ -557,10 +708,11 @@ export async function convertVideoToAnaglyph(options) {
       return {
         width,
         height,
-        sourceRect:
-          width === vis.width && height === vis.height
-            ? undefined
-            : { x: 0, y: 0, width, height },
+        // Crop rect for both frame-copy paths, relative to the frame's
+        // visible rect origin (the convention `copyTo`'s rect uses).
+        copyRect: { x: 0, y: 0, width, height },
+        copyMode,
+        copyCtx,
         blender,
         strategy,
         plan,
@@ -592,7 +744,7 @@ export async function convertVideoToAnaglyph(options) {
       stageMs.blend += performance.now() - blendStart;
 
       const waitStart = performance.now();
-      await drainQueue(encoder, "encodeQueueSize", ENCODE_QUEUE_LIMIT);
+      await withAbort(drainQueue(encoder, "encodeQueueSize", ENCODE_QUEUE_LIMIT));
       stageMs.encodeWait += performance.now() - waitStart;
       checkAbort();
       const outFrame = new VideoFrame(blended, {
@@ -664,23 +816,28 @@ export async function convertVideoToAnaglyph(options) {
             core ??= await planFromFrame(videoFrame);
             entry.rgba = pool.acquire();
             const copyStart = performance.now();
-            const written = await videoFrame.copyTo(new Uint8Array(entry.rgba), {
-              format: "RGBA",
-              rect: core.sourceRect,
-            });
-            stageMs.copy += performance.now() - copyStart;
-            // copyTo returns bytes written: a number in older implementations,
-            // a VideoFrameCopyToResult ({ length, bytesWritten }) now; some
-            // builds resolve undefined and rely on throwing for short copies.
-            const bytes =
-              typeof written === "number"
-                ? written
-                : (written?.bytesWritten ?? entry.rgba.byteLength);
-            if (bytes !== entry.rgba.byteLength) {
-              throw new PipelineError(
-                `decoder frame copy wrote ${bytes} of ${entry.rgba.byteLength} expected bytes`,
-              );
+            const target = new Uint8Array(entry.rgba);
+            if (core.copyMode === "canvas") {
+              await extractViaCanvas(videoFrame, target, core.copyCtx, core.copyRect);
+            } else {
+              const written = await videoFrame.copyTo(target, {
+                format: "RGBA",
+                rect: core.copyRect,
+              });
+              // copyTo returns bytes written: a number in older implementations,
+              // a VideoFrameCopyToResult ({ length, bytesWritten }) now; some
+              // builds resolve undefined and rely on throwing for short copies.
+              const bytes =
+                typeof written === "number"
+                  ? written
+                  : (written?.bytesWritten ?? entry.rgba.byteLength);
+              if (bytes !== entry.rgba.byteLength) {
+                throw new PipelineError(
+                  `decoder frame copy wrote ${bytes} of ${entry.rgba.byteLength} expected bytes`,
+                );
+              }
             }
+            stageMs.copy += performance.now() - copyStart;
             videoFrame.close();
             pendingEntries.set(entry.index, entry);
             await handleStrategyResult(core.strategy.push(entry));
@@ -710,11 +867,14 @@ export async function convertVideoToAnaglyph(options) {
       if (fatalError) throw fatalError;
       decoder.decode(packet.toEncodedVideoChunk());
       const waitStart = performance.now();
-      await drainQueue(decoder, "decodeQueueSize", DECODE_QUEUE_LIMIT);
+      await withAbort(drainQueue(decoder, "decodeQueueSize", DECODE_QUEUE_LIMIT));
       stageMs.decodeWait += performance.now() - waitStart;
     }
-    await decoder.flush();
-    await frameChain;
+    // End-of-stream awaits are raced against cancellation: a codec that
+    // never settles its flush after teardown must not strand this function
+    // (and with it the worker's busy guard).
+    await withAbort(decoder.flush());
+    await withAbort(frameChain);
     if (fatalError) throw fatalError;
 
     // End of stream: the strategy commits every held-back pair (the last
@@ -727,8 +887,8 @@ export async function convertVideoToAnaglyph(options) {
       );
     }
 
-    await encoder.flush();
-    await muxChain;
+    await withAbort(encoder.flush());
+    await withAbort(muxChain);
     if (fatalError) throw fatalError;
     reportProgress();
 
@@ -750,6 +910,9 @@ export async function convertVideoToAnaglyph(options) {
       audioNote = `${core.audio.copy} (stream copy)`;
     }
 
+    // Last cancellation checkpoint: finalizing the muxer after an abort is
+    // pointless and would race the packet sources still being drained.
+    checkAbort();
     await core.output.finalize();
     const blob = new Blob([core.output.target.buffer], { type: core.plan.mimeType });
 
@@ -764,6 +927,7 @@ export async function convertVideoToAnaglyph(options) {
         encoder: `${core.plan.codec} (${accelLabel(core.plan.accel)})`,
         decoder: `${source.codecString} (${decoderMode})`,
         blender: core.blender.is_gpu() ? "WebGPU" : "CPU (fallback)",
+        frameCopy: core.copyMode === "canvas" ? "canvas raster" : "copyTo",
         output: `${core.width}\u00d7${core.height}`,
         rotation: core.rotationNote,
         direction: core.strategy.auto
