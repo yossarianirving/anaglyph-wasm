@@ -115,49 +115,68 @@ async function inspectSource(file) {
 }
 
 /**
- * Choose the output encoder: try H.264 (MP4) first, then VP9 and AV1 (WebM);
- * within each codec prefer a hardware encoder. Returns null when WebCodecs
- * rejects every candidate.
+ * Choose the output encoder: try H.264 (MP4) first, then VP9, VP8 and AV1
+ * (WebM); within each codec the hardware preference order comes from
+ * `hwEncode` — on: `prefer-hardware` then browser-chosen; off:
+ * `prefer-software` then browser-chosen. VP8 sits behind VP9 for quality but
+ * in front of AV1: where VP9 encode is software-only (typical Firefox), VP8
+ * is several times faster at comparable small-frame quality. `codecHint`
+ * ("avc" | "vp9" | "vp8" | "av1") moves that family to the front of the
+ * order — the benchmark uses it to compare encoder throughput per family on
+ * one machine. Returns null when WebCodecs rejects every candidate.
+ *
+ * Exported for the benchmark page's encoder-only upper-bound probe.
  */
-async function planEncoder(width, height, frameRate) {
+export async function planEncoder(width, height, frameRate, hwEncode, latencyMode, codecHint) {
   if (typeof VideoEncoder === "undefined") return null;
 
   const level = pickAvcLevel(width, height, frameRate)
     .toString(16)
     .padStart(2, "0");
-  const candidates = [
-    ...["prefer-hardware", "no-preference"].map((accel) => ({
+  let codecs = [
+    {
       container: "mp4",
-      format: new Mp4OutputFormat({ fastStart: "in-memory" }),
+      format: () => new Mp4OutputFormat({ fastStart: "in-memory" }),
       mimeType: "video/mp4",
       videoSourceCodec: "avc",
       codec: `avc1.6400${level}`,
       extra: { avc: { format: "avc" } },
-      accel,
-    })),
-    ...["prefer-hardware", "no-preference"].flatMap((accel) => [
-      {
-        container: "webm",
-        format: new WebMOutputFormat(),
-        mimeType: "video/webm",
-        videoSourceCodec: "vp9",
-        codec: "vp09.00.10.08",
-        extra: {},
-        accel,
-      },
-      {
-        container: "webm",
-        format: new WebMOutputFormat(),
-        mimeType: "video/webm",
-        videoSourceCodec: "av1",
-        codec: "av01.0.08M.08",
-        extra: {},
-        accel,
-      },
-    ]),
+    },
+    {
+      container: "webm",
+      format: () => new WebMOutputFormat(),
+      mimeType: "video/webm",
+      videoSourceCodec: "vp9",
+      codec: "vp09.00.10.08",
+      extra: {},
+    },
+    {
+      container: "webm",
+      format: () => new WebMOutputFormat(),
+      mimeType: "video/webm",
+      videoSourceCodec: "vp8",
+      codec: "vp8",
+      extra: {},
+    },
+    {
+      container: "webm",
+      format: () => new WebMOutputFormat(),
+      mimeType: "video/webm",
+      videoSourceCodec: "av1",
+      codec: "av01.0.08M.08",
+      extra: {},
+    },
   ];
+  const accels = hwEncode
+    ? ["prefer-hardware", "no-preference"]
+    : ["prefer-software", "no-preference"];
+  if (codecHint) {
+    // Stable move of the hinted family to the front (Array#sort is stable).
+    const rank = (c) => (c.videoSourceCodec === codecHint ? 0 : 1);
+    codecs = [...codecs].sort((a, b) => rank(a) - rank(b));
+  }
 
-  for (const candidate of candidates) {
+  for (const candidate of codecs.flatMap((c) => accels.map((accel) => ({ ...c, accel })))) {
     const config = {
       codec: candidate.codec,
       width,
@@ -165,14 +184,14 @@ async function planEncoder(width, height, frameRate) {
       framerate: frameRate,
       bitrate: targetBitrate(width, height, frameRate),
       hardwareAcceleration: accelOrNull(candidate.accel),
-      latencyMode: "quality",
+      latencyMode,
       ...candidate.extra,
     };
     const support = await VideoEncoder.isConfigSupported(config).catch(
       () => ({ supported: false }),
     );
     if (support.supported) {
-      return { ...candidate, encoderConfig: config };
+      return { ...candidate, format: candidate.format(), encoderConfig: config };
     }
   }
   return null;
@@ -180,7 +199,16 @@ async function planEncoder(width, height, frameRate) {
 
 /** `hardwareAcceleration` is optional; "no-preference" is the default anyway. */
 function accelOrNull(accel) {
-  return accel === "prefer-hardware" ? "prefer-hardware" : undefined;
+  return accel === "no-preference" ? undefined : accel;
+}
+
+/** Human label for a codec's chosen `hardwareAcceleration` preference. */
+function accelLabel(accel) {
+  return accel === "prefer-hardware"
+    ? "hardware-preferred"
+    : accel === "prefer-software"
+      ? "software-forced"
+      : "browser-chosen";
 }
 
 /**
@@ -266,9 +294,21 @@ function formatStageMs(stageMs) {
  *   [options.direction] Eye pairing; `auto` detects the orbit from image
  *   motion (needs `createTracker`).
  * @param {string} [options.anaglyphType] wasm blend flavor name.
- * @param {(width: number, height: number, anaglyphType: string) => Promise<{blend: (left: Uint8Array, right: Uint8Array) => Promise<Uint8Array>, is_gpu: () => boolean}>} options.createBlender
+ * @param {{ decode?: boolean, encode?: boolean, webgpu?: boolean }}
+ *   [options.acceleration] Hardware preferences, all default true. Turning
+ *   one off forces the software path (`prefer-software` for the codecs, CPU
+ *   blend for WebGPU) with a browser-chosen fallback when the forced hint is
+ *   unsupported; useful on browsers whose hardware path is broken or slow.
+ * @param {"quality" | "realtime"} [options.encoderLatencyMode] Encoder
+ *   latency mode; "realtime" trades a little quality for significantly lower
+ *   encode latency (and buffering stalls) on some browsers.
+ * @param {"avc" | "vp9" | "vp8" | "av1"} [options.encoderCodec] Move one
+ *   codec family to the front of the encoder preference order (benchmarking
+ *   aid; unsupported hints fall through to the normal order).
+ * @param {(width: number, height: number, anaglyphType: string, backend: "cpu" | undefined) => Promise<{blend: (left: Uint8Array, right: Uint8Array) => Promise<Uint8Array>, is_gpu: () => boolean}>} options.createBlender
  *   Factory for the wasm blender. Injected so this module stays free of the
  *   wasm import and remains runnable (with a stub blender) outside a browser.
+ *   `backend` is `"cpu"` when WebGPU blending was switched off.
  * @param {(width: number, height: number, reverse: boolean) => Promise<{tracker: object, observe: (frame: object) => {dx: number, reliable: boolean}}>} [options.createTracker]
  *   Factory for the auto-direction tracker + motion observer (wasm exports
  *   `Tracker` and `MotionAnalyzer` in the browser; tests pass stubs).
@@ -281,11 +321,17 @@ export async function convertVideoToAnaglyph(options) {
     file,
     direction = "clockwise",
     anaglyphType = "color",
+    acceleration = {},
+    encoderLatencyMode = "quality",
+    encoderCodec = null,
     createBlender,
     createTracker,
     onProgress = () => {},
     signal,
   } = options;
+  const hwDecode = acceleration.decode !== false;
+  const hwEncode = acceleration.encode !== false;
+  const webgpuBlend = acceleration.webgpu !== false;
 
   const startedAt = performance.now();
   const checkAbort = () => {
@@ -317,70 +363,56 @@ export async function convertVideoToAnaglyph(options) {
   let nextFrameIndex = 0;
 
   try {
-    // Prefer a hardware decoder, but fall back to letting the browser pick
-    // (software decoders, or hardware without the hint) when the hint makes
-    // the configuration unsupported.
-    let decoderConfig = { ...source.decoderConfig, hardwareAcceleration: "prefer-hardware" };
-    let decoderMode = "hardware-preferred";
-    let decoderSupport = await VideoDecoder.isConfigSupported(decoderConfig).catch(
-      () => ({ supported: false }),
-    );
-    if (!decoderSupport.supported) {
-      decoderConfig = { ...source.decoderConfig };
-      decoderMode = "browser-chosen";
-      decoderSupport = await VideoDecoder.isConfigSupported(decoderConfig).catch(
+    // Decoder preference: hardware first by default, forced software when
+    // switched off; "no-preference" remains the fallback whenever a hint is
+    // unsupported for this codec.
+    const decodePrefs = hwDecode
+      ? [["prefer-hardware", "hardware-preferred"], [undefined, "browser-chosen"]]
+      : [["prefer-software", "software-forced"], [undefined, "browser-chosen"]];
+    let decoderConfig = null;
+    let decoderMode = "browser-chosen";
+    for (const [accel, mode] of decodePrefs) {
+      const candidate = accel
+        ? { ...source.decoderConfig, hardwareAcceleration: accel }
+        : { ...source.decoderConfig };
+      const support = await VideoDecoder.isConfigSupported(candidate).catch(
         () => ({ supported: false }),
       );
+      if (support.supported) {
+        decoderConfig = candidate;
+        decoderMode = mode;
+        break;
+      }
     }
-    if (!decoderSupport.supported) {
+    if (!decoderConfig) {
       throw new PipelineError(`this browser cannot decode "${source.codecString}"`);
     }
 
-    // H.264 needs even frame dimensions; blend and encode on the cropped
-    // frame. Rotation/flip are container metadata and pass through untouched.
-    const width = source.codedWidth & ~1;
-    const height = source.codedHeight & ~1;
-    if (width < 2 || height < 2) {
-      throw new PipelineError("video frames are too small to convert");
-    }
-
-    const plan = await planEncoder(width, height, source.frameRate);
-    if (!plan) {
-      throw new PipelineError("no supported video encoder found (tried H.264, VP9, AV1)");
-    }
-    const audio = planAudioCopy(source.audioCodec, plan.container);
-
-    const blender = await createBlender(width, height, anaglyphType);
-    pool = new BufferPool(width * height * 4);
-
-    let strategy;
-    if (direction === "auto" || direction === "auto-reverse") {
-      if (!createTracker) {
-        throw new PipelineError(`direction "${direction}" needs a tracker factory`);
-      }
-      const auto = await createTracker(width, height, direction === "auto-reverse");
-      strategy = createPairStrategy(direction, auto);
-    } else {
-      strategy = createPairStrategy(direction);
-    }
-
-    // ---- Output: muxer with compressed packet sources ----
-    const output = new Output({ format: plan.format, target: new BufferTarget() });
-    const videoSource = new EncodedVideoPacketSource(plan.videoSourceCodec);
-    // No frameRate metadata: the packet timestamps carry the true cadence,
-    // and a rounded fps here would pick a coarse timescale that collides
-    // (duplicate DTS) for rates like 33.33.
-    output.addVideoTrack(videoSource, {
-      rotation: source.rotation,
-      flip: source.flip,
-    });
-    /** @type {EncodedAudioPacketSource | null} */
-    let audioSource = null;
-    if (audio.copy) {
-      audioSource = new EncodedAudioPacketSource(audio.copy);
-      output.addAudioTrack(audioSource);
-    }
-    await output.start();
+    // The encoder, blender, muxer, tracker and buffer pool are built lazily
+    // from the first *decoded* frame, not from container metadata: decoders
+    // differ in how they treat the container's rotation and coded padding
+    // (Safari/VideoToolbox bakes transforms into frames, others pass them
+    // through untouched). Planning from the frames themselves keeps the RGBA
+    // copy size, blend dimensions and encoder configuration consistent on
+    // every browser, which is what prevented the garbled mobile-Safari
+    // outputs (transposed frames copied into untransposed strides show up
+    // as tiled gray anaglyphs).
+    /**
+     * @typedef {object} PipelineCore
+     * @property {number} width
+     * @property {number} height
+     * @property {{ x: number, y: number, width: number, height: number }|undefined} sourceRect
+     * @property {{ blend: Function, is_gpu: () => boolean }} blender
+     * @property {object} strategy
+     * @property {object} plan
+     * @property {{ copy: string|null, reason: string|null }} audio
+     * @property {EncodedAudioPacketSource|null} audioSource
+     * @property {Output} output
+     * @property {EncodedVideoPacketSource} videoSource
+     * @property {string} rotationNote
+     */
+    /** @type {PipelineCore | null} */
+    let core = null;
 
     // Stages WebCodecs exposes only through callbacks are serialized onto
     // promise chains: frame processing (decoder output) and muxing (encoder
@@ -391,6 +423,148 @@ export async function convertVideoToAnaglyph(options) {
     let muxChain = Promise.resolve();
     let videoChunks = 0;
 
+    /** Latch an error from a detached chain step (never reject the chain:
+     * pending steps must still run their cleanup, and the main flow rethrows
+     * `fatalError` — a rejected chain would surface as an unhandled
+     * rejection after a cancel abandoned the awaits). */
+    const latch = (e) => {
+      fatalError ??= e instanceof Error ? e : new Error(String(e));
+    };
+
+    /** Build everything that needs real frame dimensions. Runs once, on the
+     * first decoded frame, inside `frameChain`. */
+    async function planFromFrame(videoFrame) {
+      const vis = videoFrame.visibleRect ?? {
+        x: 0,
+        y: 0,
+        width: videoFrame.codedWidth,
+        height: videoFrame.codedHeight,
+      };
+      // H.264 needs even frame dimensions; blend and encode on the cropped
+      // visible area.
+      const width = vis.width & ~1;
+      const height = vis.height & ~1;
+      if (width < 2 || height < 2) {
+        throw new PipelineError("video frames are too small to convert");
+      }
+
+      // Rotation/flip: container metadata is passed straight through when
+      // the decoder hands back frames in the container's coded geometry. If
+      // the frames arrive in the *displayed* geometry instead (a decoder
+      // that baked the transform, Safari among them), baking must not be
+      // applied twice, so the output carries no transform. A 180-degree
+      // rotation cannot be told apart by geometry alone; the coded-geometry
+      // case wins there, matching every decoder tested so far.
+      const srcRot = source.rotation ?? 0;
+      const srcFlip = source.flip ?? false;
+      const swap = Math.abs(srcRot % 180) === 90;
+      const codedMatch =
+        videoFrame.codedWidth === source.codedWidth &&
+        videoFrame.codedHeight === source.codedHeight;
+      const displayMatch =
+        videoFrame.codedWidth === (swap ? source.codedHeight : source.codedWidth) &&
+        videoFrame.codedHeight === (swap ? source.codedWidth : source.codedHeight);
+      let rotation = srcRot;
+      let flip = srcFlip;
+      let rotationNote;
+      if (codedMatch || (!displayMatch && srcRot === 0 && !srcFlip)) {
+        rotationNote = srcRot ? `${srcRot}\u00b0 (container metadata)` : "none";
+      } else if (displayMatch && (srcRot !== 0 || srcFlip)) {
+        rotation = 0;
+        flip = false;
+        rotationNote = `${srcRot}\u00b0${srcFlip ? " + flip" : ""} baked in by decoder`;
+      } else {
+        rotationNote = `${srcRot}\u00b0 (container) on ${videoFrame.codedWidth}\u00d7${videoFrame.codedHeight} frames`;
+      }
+
+      const plan = await planEncoder(
+        width,
+        height,
+        source.frameRate,
+        hwEncode,
+        encoderLatencyMode,
+        encoderCodec,
+      );
+      if (!plan) {
+        throw new PipelineError("no supported video encoder found (tried H.264, VP9, VP8, AV1)");
+      }
+      const audio = planAudioCopy(source.audioCodec, plan.container);
+
+      // ---- Output: muxer with compressed packet sources ----
+      const output = new Output({ format: plan.format, target: new BufferTarget() });
+      const videoSource = new EncodedVideoPacketSource(plan.videoSourceCodec);
+      // No frameRate metadata: the packet timestamps carry the true cadence,
+      // and a rounded fps here would pick a coarse timescale that collides
+      // (duplicate DTS) for rates like 33.33.
+      output.addVideoTrack(videoSource, { rotation, flip });
+      /** @type {EncodedAudioPacketSource | null} */
+      let audioSource = null;
+      if (audio.copy) {
+        audioSource = new EncodedAudioPacketSource(audio.copy);
+        output.addAudioTrack(audioSource);
+      }
+      await output.start();
+
+      encoder = new VideoEncoder({
+        output(chunk, meta) {
+          const data = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(data);
+          const packet = new EncodedPacket(
+            data,
+            chunk.type,
+            (chunk.timestamp - t0Us) / 1e6,
+            (chunk.duration ?? fallbackDurationUs) / 1e6,
+          );
+          // The first chunk carries the decoder initialization config (avcC,
+          // vpcC, ...); later ones need no meta.
+          const isFirst = videoChunks++ === 0;
+          muxChain = muxChain
+            .then(() => videoSource.add(packet, isFirst ? meta : undefined))
+            .catch(latch);
+        },
+        error(e) {
+          fatalError ??= e instanceof Error ? e : new Error(String(e));
+        },
+      });
+      encoder.configure(plan.encoderConfig);
+
+      const blender = await createBlender(
+        width,
+        height,
+        anaglyphType,
+        webgpuBlend ? undefined : "cpu",
+      );
+      pool = new BufferPool(width * height * 4);
+
+      let strategy;
+      if (direction === "auto" || direction === "auto-reverse") {
+        if (!createTracker) {
+          throw new PipelineError(`direction "${direction}" needs a tracker factory`);
+        }
+        const auto = await createTracker(width, height, direction === "auto-reverse");
+        strategy = createPairStrategy(direction, auto);
+      } else {
+        strategy = createPairStrategy(direction);
+      }
+
+      return {
+        width,
+        height,
+        sourceRect:
+          width === vis.width && height === vis.height
+            ? undefined
+            : { x: 0, y: 0, width, height },
+        blender,
+        strategy,
+        plan,
+        audio,
+        audioSource,
+        output,
+        videoSource,
+        rotationNote,
+      };
+    }
+
     const keyframeEvery = Math.max(
       1,
       Math.round(source.frameRate * KEYFRAME_INTERVAL_S),
@@ -400,47 +574,11 @@ export async function convertVideoToAnaglyph(options) {
     /** @type {number | null} */
     let t0Us = null;
 
-    encoder = new VideoEncoder({
-      output(chunk, meta) {
-        const data = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(data);
-        const packet = new EncodedPacket(
-          data,
-          chunk.type,
-          (chunk.timestamp - t0Us) / 1e6,
-          (chunk.duration ?? fallbackDurationUs) / 1e6,
-        );
-        // The first chunk carries the decoder initialization config (avcC,
-        // vpcC, ...); later ones need no meta.
-        const isFirst = videoChunks++ === 0;
-        muxChain = muxChain
-          .then(() => videoSource.add(packet, isFirst ? meta : undefined))
-          .catch(latch);
-      },
-      error(e) {
-        fatalError ??= e instanceof Error ? e : new Error(String(e));
-      },
-    });
-    encoder.configure(plan.encoderConfig);
-
-    /** Latch an error from a detached chain step (never reject the chain:
-     * pending steps must still run their cleanup, and the main flow rethrows
-     * `fatalError` — a rejected chain would surface as an unhandled
-     * rejection after a cancel abandoned the awaits). */
-    const latch = (e) => {
-      fatalError ??= e instanceof Error ? e : new Error(String(e));
-    };
-
-    const sourceRect =
-      width === source.codedWidth && height === source.codedHeight
-        ? undefined
-        : { x: 0, y: 0, width, height };
-
     /** Blend an already-paired pair (owned RGBA buffers) and encode it. */
     async function emitPair(pair) {
       t0Us ??= pair.timestamp;
       const blendStart = performance.now();
-      const blended = await blender.blend(
+      const blended = await core.blender.blend(
         new Uint8Array(pair.left.rgba),
         new Uint8Array(pair.right.rgba),
       );
@@ -452,8 +590,8 @@ export async function convertVideoToAnaglyph(options) {
       checkAbort();
       const outFrame = new VideoFrame(blended, {
         format: "RGBA",
-        codedWidth: width,
-        codedHeight: height,
+        codedWidth: core.width,
+        codedHeight: core.height,
         timestamp: pair.timestamp - t0Us,
         duration: pair.duration > 0 ? pair.duration : fallbackDurationUs,
         alphaMode: "discard",
@@ -493,8 +631,8 @@ export async function convertVideoToAnaglyph(options) {
           ? Math.round(source.duration * source.frameRate)
           : null,
         fps: elapsed > 0 ? pairCount / elapsed : 0,
-        gpuBlend: blender.is_gpu(),
-        auto: strategy.auto,
+        gpuBlend: core.blender.is_gpu(),
+        auto: core.strategy.auto,
         reversals: reversalsFound.length,
       });
     }
@@ -505,7 +643,8 @@ export async function convertVideoToAnaglyph(options) {
         // VideoFrame closed: held-back (auto) frames would otherwise pin
         // decoder-owned memory, and motion analysis + blending both need
         // dense pixels. All processing runs serialized on frameChain, so a
-        // frame's buffer always outlives the pairs that reference it.
+        // frame's buffer always outlives the pairs that reference it, and
+        // the first frame also plans the rest of the pipeline.
         const entry = {
           index: nextFrameIndex++,
           timestamp: videoFrame.timestamp,
@@ -515,20 +654,34 @@ export async function convertVideoToAnaglyph(options) {
         };
         frameChain = frameChain
           .then(async () => {
+            core ??= await planFromFrame(videoFrame);
             entry.rgba = pool.acquire();
             const copyStart = performance.now();
-            await videoFrame.copyTo(new Uint8Array(entry.rgba), {
+            const written = await videoFrame.copyTo(new Uint8Array(entry.rgba), {
               format: "RGBA",
-              rect: sourceRect,
+              rect: core.sourceRect,
             });
             stageMs.copy += performance.now() - copyStart;
+            // copyTo returns bytes written: a number in older implementations,
+            // a VideoFrameCopyToResult ({ length, bytesWritten }) now; some
+            // builds resolve undefined and rely on throwing for short copies.
+            const bytes =
+              typeof written === "number"
+                ? written
+                : (written?.bytesWritten ?? entry.rgba.byteLength);
+            if (bytes !== entry.rgba.byteLength) {
+              throw new PipelineError(
+                `decoder frame copy wrote ${bytes} of ${entry.rgba.byteLength} expected bytes`,
+              );
+            }
             videoFrame.close();
             pendingEntries.set(entry.index, entry);
-            await handleStrategyResult(strategy.push(entry));
+            await handleStrategyResult(core.strategy.push(entry));
           })
           .catch((e) => {
-            // Copy failures and cancellation land here; pending steps still
-            // run (closing their VideoFrame), the main flow rethrows.
+            // Planning, copy failures and cancellation land here; pending
+            // steps still run (closing their VideoFrame), the main flow
+            // rethrows.
             latch(e);
             try {
               videoFrame.close();
@@ -559,7 +712,7 @@ export async function convertVideoToAnaglyph(options) {
 
     // End of stream: the strategy commits every held-back pair (the last
     // frame never pairs; like the native pipeline, N inputs give N-1 pairs).
-    await handleStrategyResult(strategy.flush());
+    await handleStrategyResult(core ? core.strategy.flush() : { pairs: [], reversals: [], releasedBefore: -1 });
 
     if (pairCount === 0) {
       throw new PipelineError(
@@ -573,8 +726,8 @@ export async function convertVideoToAnaglyph(options) {
     reportProgress();
 
     // ---- Audio: stream-copy compressed packets onto the video timeline ----
-    let audioNote = audio.reason;
-    if (audioSource) {
+    let audioNote = core.audio.reason;
+    if (core.audioSource) {
       const audioSink = new EncodedPacketSink(source.audioTrack);
       const decoderConfig = await source.audioTrack.getDecoderConfig();
       const meta = decoderConfig ? { decoderConfig } : undefined;
@@ -584,14 +737,14 @@ export async function convertVideoToAnaglyph(options) {
         checkAbort();
         const shifted =
           shiftS === 0 ? packet : packet.clone({ timestamp: packet.timestamp - shiftS });
-        await audioSource.add(shifted, firstAudio ? meta : undefined);
+        await core.audioSource.add(shifted, firstAudio ? meta : undefined);
         firstAudio = false;
       }
-      audioNote = `${audio.copy} (stream copy)`;
+      audioNote = `${core.audio.copy} (stream copy)`;
     }
 
-    await output.finalize();
-    const blob = new Blob([output.target.buffer], { type: plan.mimeType });
+    await core.output.finalize();
+    const blob = new Blob([core.output.target.buffer], { type: core.plan.mimeType });
 
     const elapsed = (performance.now() - startedAt) / 1e3;
     return {
@@ -600,18 +753,18 @@ export async function convertVideoToAnaglyph(options) {
         frames: pairCount,
         seconds: elapsed,
         fps: elapsed > 0 ? pairCount / elapsed : null,
-        container: plan.container,
-        encoder: `${plan.codec} (${
-          plan.accel === "prefer-hardware" ? "hardware-preferred" : "browser-chosen"
-        })`,
+        container: core.plan.container,
+        encoder: `${core.plan.codec} (${accelLabel(core.plan.accel)})`,
         decoder: `${source.codecString} (${decoderMode})`,
-        blender: blender.is_gpu() ? "WebGPU" : "CPU (fallback)",
-        direction: strategy.auto
+        blender: core.blender.is_gpu() ? "WebGPU" : "CPU (fallback)",
+        output: `${core.width}\u00d7${core.height}`,
+        rotation: core.rotationNote,
+        direction: core.strategy.auto
           ? direction === "auto-reverse"
             ? "auto (reversed)"
             : "auto"
           : direction,
-        reversals: strategy.auto ? formatReversals(reversalsFound) : "n/a",
+        reversals: core.strategy.auto ? formatReversals(reversalsFound) : "n/a",
         audio: audioNote ?? "none",
         width: source.codedWidth,
         height: source.codedHeight,
