@@ -48,6 +48,13 @@ async function handleRightImageUpload(e) {
 
 async function handleGifUpload(e) {
   var gifData = new Uint8Array(await e.data.gif.arrayBuffer());
+  if (gifData.byteLength === 0) {
+    postMessage({
+      type: "anaglyph-error",
+      message: "the uploaded file is empty",
+    });
+    return;
+  }
   anaglyph.set_gif(gifData);
   postMessage({ type: "gif-loaded" });
 }
@@ -69,11 +76,22 @@ function handleAnaglyphSubmit(e) {
   postMessage({ type: "anaglyph-result", image: imageBitmap }, [imageBitmap]);
 }
 
-function handleAnaglyphSubmitGif(e) {
+async function handleAnaglyphSubmitGif(e) {
   var anaglyphType = e.data.anaglyphType;
   var videoDirection = e.data.videoDirection;
-  var resultGif = anaglyph.gif_to_anaglyph(anaglyphType, videoDirection);
-  var blob = new Blob([new Uint8Array(resultGif)], { type: "image/gif" });
-  var url = URL.createObjectURL(blob);
-  postMessage({ type: "anaglyph-result-gif", url: url });
+  try {
+    // Async: blends frames on WebGPU (with a CPU fallback inside wasm).
+    var resultGif = await anaglyph.gif_to_anaglyph_async(
+      anaglyphType,
+      videoDirection,
+    );
+    var blob = new Blob([new Uint8Array(resultGif)], { type: "image/gif" });
+    var url = URL.createObjectURL(blob);
+    postMessage({ type: "anaglyph-result-gif", url: url });
+  } catch (err) {
+    postMessage({
+      type: "anaglyph-error",
+      message: String(err && err.message ? err.message : err),
+    });
+  }
 }

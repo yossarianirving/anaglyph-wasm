@@ -1,6 +1,5 @@
 use anaglyph_rs::anaglyph::{left_right_to_anaglyph_offset, AnaglyphType, Offset, VideoDirection};
-use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph;
-use image::codecs::gif::{GifDecoder, GifEncoder};
+use anaglyph_rs::gif::{convert_gif_buffer_to_anaglyph, convert_gif_buffer_to_anaglyph_async};
 use image::{buffer::ConvertBuffer, imageops, RgbImage, RgbaImage};
 use wasm_bindgen::prelude::*;
 extern crate web_sys;
@@ -144,11 +143,19 @@ impl Anaglyph {
         }
     }
 
-    pub fn gif_to_anaglyph(
+    /// Convert the stored gif into an anaglyph gif, returned as raw gif
+    /// bytes.
+    ///
+    /// With the `gpu` feature enabled, frame blending runs on the GPU via
+    /// WebGPU and falls back to a CPU loop when no usable adapter is
+    /// available (the reason is logged to the console); without it, blending
+    /// stays on the CPU. The method is async so the JS API is stable across
+    /// both builds: callers must `await` the returned promise.
+    pub async fn gif_to_anaglyph_async(
         &self,
         anaglyph_type: Option<String>,
         video_direction: Option<String>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, JsValue> {
         let a_type = match anaglyph_type.as_deref() {
             Some("color") => AnaglyphType::Color,
             Some("half-color") => AnaglyphType::HalfColor,
@@ -165,9 +172,41 @@ impl Anaglyph {
 
         let _timer = Timer::new("To Anaglyph");
 
-        let anaglyph_gif = convert_gif_buffer_to_anaglyph(&self.gif, direction, a_type);
+        convert_gif_buffer_to_anaglyph_async(&self.gif, direction, a_type)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("gif conversion failed: {e}")))
+    }
 
-        anaglyph_gif
+    /// Same conversion as [`Self::gif_to_anaglyph_async`] but always on the
+    /// CPU and fully synchronous (blocks the event loop until done). Used by
+    /// the benchmark page to compare CPU vs WebGPU from the same build.
+    ///
+    /// Note: this goes through the panicking sync path in `anaglyph-rs` for
+    /// undecodable input, so only feed it files already accepted by the
+    /// upload flow.
+    pub fn gif_to_anaglyph_cpu(
+        &self,
+        anaglyph_type: Option<String>,
+        video_direction: Option<String>,
+    ) -> Result<Vec<u8>, JsValue> {
+        if self.gif.is_empty() {
+            return Err(JsValue::from_str("no gif data uploaded"));
+        }
+        let a_type = match anaglyph_type.as_deref() {
+            Some("color") => AnaglyphType::Color,
+            Some("half-color") => AnaglyphType::HalfColor,
+            Some("grayscale") => AnaglyphType::GrayScale,
+            Some("optimized") => AnaglyphType::Optimized,
+            Some("true") => AnaglyphType::True,
+            Some(_) | None => AnaglyphType::Color,
+        };
+        let direction = match video_direction.as_deref() {
+            Some("clockwise") => VideoDirection::Clockwise,
+            Some("counter-clockwise") => VideoDirection::CounterClockwise,
+            Some(_) | None => VideoDirection::Clockwise,
+        };
+
+        Ok(convert_gif_buffer_to_anaglyph(&self.gif, direction, a_type))
     }
 
     pub fn get_width(&self) -> u32 {

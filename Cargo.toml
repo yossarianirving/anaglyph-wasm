@@ -7,15 +7,26 @@ edition = "2021"
 
 [dependencies]
 #anaglyph-rs = { git = "https://github.com/yossarianirving/anaglyph-rs.git", branch = "main" }
+# `gpu` (off by default; see [features]) switches gif blending to the
+# WebGPU compute path: gif_to_anaglyph_async then runs frames through
+# convert_gif_buffer_to_anaglyph_async with a CPU fallback.
 anaglyph-rs = { path = "../anaglyph-rs" }
 image = { version = "0.25.5", features = ["gif"] }
 wasm-bindgen = "0.2.92"
+wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
 version = "0.3.4"
 features = [
   'console'
 ]
+
+[features]
+default = []
+# WebGPU blending for gifs, currently off while we evaluate its impact
+# (see bench.html: on SwiftShader the GPU path measured slower than CPU).
+# Re-enable with: wasm-pack build --target web --release --features gpu
+gpu = ["anaglyph-rs/gpu"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

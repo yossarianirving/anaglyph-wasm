@@ -54,14 +54,25 @@
                 >
                     Submit
                 </button>
+                <span
+                    id="status"
+                    style="display: none"
+                    class="ms-2 text-muted"
+                    >Converting…</span
+                >
             </form>
 
             <img id="resultGif" style="display: none; max-width: 95%" />
         </main>
         <script type="module">
-            import init, { Anaglyph } from "./pkg/anaglyph_wasm.js";
-            var anaglyph;
             var worker = new Worker("anaglyph-worker.js", { type: "module" });
+
+            function setBusy(busy) {
+                document.getElementById("submit").disabled = busy;
+                document.getElementById("status").style.display = busy
+                    ? "inline"
+                    : "none";
+            }
 
             worker.onmessage = function (e) {
                 switch (e.data.type) {
@@ -70,24 +81,20 @@
                         var resultGif = document.getElementById("resultGif");
                         resultGif.src = url;
                         resultGif.style.display = "block";
-                        document.getElementById("submit").disabled = false;
-
+                        setBusy(false);
+                        break;
+                    case "anaglyph-error":
+                        alert("GIF conversion failed: " + e.data.message);
+                        setBusy(false);
                         break;
                     case "gif-loaded":
-                        document.getElementById("submit").disabled = false;
+                        setBusy(false);
                         break;
                     case "ready":
-                        document.getElementById("submit").disabled = false;
+                        setBusy(false);
                         break;
                 }
             };
-
-            async function run() {
-                document.getElementById("submit").disabled = true;
-                await init();
-                anaglyph = Anaglyph.new();
-            }
-            run();
 
             document
                 .getElementById("gifFile")

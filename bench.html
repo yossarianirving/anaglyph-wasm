@@ -1,0 +1,196 @@
+<html>
+    <head>
+        <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            crossorigin="anonymous"
+        />
+        <title>Anaglyph wasm benchmark: WebGPU vs CPU</title>
+    </head>
+    <body>
+        <main class="container py-4">
+            <h1>Gif &rarr; anaglyph: WebGPU vs CPU</h1>
+            <p class="text-muted">
+                Each gif is converted repeatedly through both paths of the
+                same wasm build: <code>gif_to_anaglyph_async</code> (WebGPU
+                compute shader, CPU fallback if unavailable) and
+                <code>gif_to_anaglyph_cpu</code> (blocking single-threaded
+                CPU loop). Runs are interleaved; one warmup run per path is
+                discarded. Note the encoding pass (gif decode + encode) runs
+                on the CPU in both paths; only frame blending differs.
+            </p>
+            <button type="button" class="btn btn-primary mb-3" id="run">
+                Run benchmark
+            </button>
+            <span
+                id="status"
+                class="ms-2 text-muted"
+                style="display: none"
+            ></span>
+
+            <table class="table table-striped" id="results">
+                <thead>
+                    <tr>
+                        <th>Gif</th>
+                        <th>Frames</th>
+                        <th>Runs</th>
+                        <th>CPU mean</th>
+                        <th>GPU mean</th>
+                        <th>CPU best</th>
+                        <th>GPU best</th>
+                        <th>Speedup (best)</th>
+                        <th>Outputs match</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <p id="note" class="text-muted"></p>
+        </main>
+        <script type="module">
+            import init, { Anaglyph } from "./pkg/anaglyph_wasm.js";
+
+            const CASES = [
+                { name: "small.gif", url: "bench/small.gif", runs: 7 },
+                { name: "medium.gif", url: "bench/medium.gif", runs: 5 },
+                { name: "large.gif", url: "bench/large.gif", runs: 3 },
+            ];
+
+            let gpuLogSeen = false;
+            let fallbackLogSeen = false;
+            const origLog = console.log.bind(console);
+            console.log = (...a) => {
+                const s = a.join(" ");
+                if (s.includes("blending frames on WebGPU")) gpuLogSeen = true;
+                if (s.includes("WebGPU unavailable")) fallbackLogSeen = true;
+                origLog(...a);
+            };
+
+            function setStatus(text) {
+                const el = document.getElementById("status");
+                el.textContent = text;
+                el.style.display = text ? "inline" : "none";
+            }
+
+            function countDiffering(a, b) {
+                const n = Math.max(a.length, b.length);
+                let diff = 0;
+                for (let i = 0; i < n; i++) if (a[i] !== b[i]) diff++;
+                return diff;
+            }
+
+            async function benchCase(anaglyph, c) {
+                const bytes = new Uint8Array(
+                    await (await fetch(c.url)).arrayBuffer(),
+                );
+                anaglyph.set_gif(bytes);
+                const frameCount = await countFrames(bytes);
+
+                // Warmup both paths (JIT, decoder caches, WebGPU init).
+                await anaglyph.gif_to_anaglyph_async("color", "clockwise");
+                anaglyph.gif_to_anaglyph_cpu("color", "clockwise");
+
+                const gpu = [];
+                const cpu = [];
+                let diff = null;
+                for (let i = 0; i < c.runs; i++) {
+                    const t0 = performance.now();
+                    const outGpu = await anaglyph.gif_to_anaglyph_async(
+                        "color",
+                        "clockwise",
+                    );
+                    const t1 = performance.now();
+                    const outCpu = anaglyph.gif_to_anaglyph_cpu(
+                        "color",
+                        "clockwise",
+                    );
+                    const t2 = performance.now();
+                    gpu.push(t1 - t0);
+                    cpu.push(t2 - t1);
+                    if (diff === null) diff = countDiffering(outGpu, outCpu);
+                }
+
+                const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
+                const best = (v) => Math.min(...v);
+                return {
+                    name: c.name,
+                    frames: frameCount,
+                    runs: c.runs,
+                    cpuMean: mean(cpu),
+                    gpuMean: mean(gpu),
+                    cpuBest: best(cpu),
+                    gpuBest: best(gpu),
+                    differingBytes: diff,
+                };
+            }
+
+            // Heuristic frame count: animated gifs carry one Graphic
+            // Control Extension (0x21 0xF9) per frame.
+            function countFrames(bytes) {
+                let frames = 0;
+                for (let i = 0; i + 1 < bytes.length; i++) {
+                    if (bytes[i] === 0x21 && bytes[i + 1] === 0xf9) frames++;
+                }
+                return frames;
+            }
+
+            function render(results) {
+                const tbody = document.querySelector("#results tbody");
+                tbody.innerHTML = "";
+                for (const r of results) {
+                    const speedup = r.cpuBest / r.gpuBest;
+                    const tr = document.createElement("tr");
+                    const cells = [
+                        r.name,
+                        r.frames,
+                        r.runs,
+                        r.cpuMean.toFixed(1) + " ms",
+                        r.gpuMean.toFixed(1) + " ms",
+                        r.cpuBest.toFixed(1) + " ms",
+                        r.gpuBest.toFixed(1) + " ms",
+                        speedup.toFixed(2) + "x",
+                        r.differingBytes === 0
+                            ? "byte-identical"
+                            : r.differingBytes + " bytes differ",
+                    ];
+                    for (const c of cells) {
+                        const td = document.createElement("td");
+                        td.textContent = c;
+                        tr.appendChild(td);
+                    }
+                    tbody.appendChild(tr);
+                }
+            }
+
+            window.__bench = null;
+            document
+                .getElementById("run")
+                .addEventListener("click", async () => {
+                    document.getElementById("run").disabled = true;
+                    setStatus("Loading wasm…");
+                    await init();
+                    const anaglyph = Anaglyph.new();
+                    const results = [];
+                    for (const c of CASES) {
+                        setStatus(`Benchmarking ${c.name}…`);
+                        results.push(await benchCase(anaglyph, c));
+                        render(results);
+                    }
+                    window.__bench = {
+                        results,
+                        gpuUsed: gpuLogSeen,
+                        cpuFallback: fallbackLogSeen,
+                        renderer: navigator.gpu
+                            ? "WebGPU present"
+                            : "no navigator.gpu",
+                    };
+                    document.getElementById("note").textContent =
+                        gpuLogSeen && !fallbackLogSeen
+                            ? "WebGPU was used for the GPU runs."
+                            : "WebGPU unavailable — the GPU path fell back to CPU; results do not measure WebGPU.";
+                    setStatus("Done");
+                    document.getElementById("run").disabled = false;
+                });
+        </script>
+    </body>
+</html>
