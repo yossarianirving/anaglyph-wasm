@@ -1,12 +1,19 @@
 /**
- * Benchmark runner: the browser pipeline (headless Chromium via
+ * Benchmark runner: the browser pipeline (headless Chromium or Firefox via
  * bench-video.html) plus the native CLI, over a fixed clip matrix.
  *
  * Usage: node bench/run-web-bench.mjs [--iters N] [--gpu] [--skip-native]
+ *                                     [--browser chromium|firefox]
+ *                                     [--latency quality|realtime] [--hw off]
  *
  * Results land in bench/results/web-<timestamp>.json (and
  * bench/results/latest.md as a markdown summary). Read them with
  * `node bench/compare.mjs a.json b.json` to diff two runs.
+ *
+ * Firefox runs open-codec WebM clips: Playwright's Firefox build carries no
+ * proprietary H.264/MP4 codecs, and the WebM set keeps the two browsers
+ * comparable stage-for-stage (software codecs on both sides unless the host
+ * exposes hardware ones to the browser).
  *
  * Headless caveat: unless you run this where Chromium can use real hardware
  * (`--gpu` plus a desktop GPU with WebGPU and hardware codecs), the browser
@@ -19,7 +26,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright";
+import { chromium, firefox } from "playwright";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const PORT = 8124;
@@ -33,8 +40,21 @@ const argValue = (name, fallback) => {
 const ITERS = parseInt(argValue("--iters", "3"), 10);
 const WITH_GPU = process.argv.includes("--gpu");
 const SKIP_NATIVE = process.argv.includes("--skip-native");
+const BROWSER = argValue("--browser", "chromium");
+const LATENCY = argValue("--latency", "quality");
+// Restrict every run to one codec family ("avc" | "vp9" | "vp8" | "av1").
+const CODEC = argValue("--codec", null);
+// `--hw off` disables hardware decode AND encode preferences.
+const HW = argValue("--hw", "on");
 
-const CLIPS = ["bench/booth2s.mp4", "bench/booth2s-aac.mp4", "bench/boomerang.mp4"];
+// Firefox (and any browser compared against it) uses the open-codec WebM
+// set; `--webm` forces the same set on every browser for apples-to-apples
+// cross-browser runs.
+const WEBM_CLIPS = ["bench/booth2s-vp9.webm", "bench/boomerang-vp9.webm"];
+const CLIPS =
+  BROWSER === "firefox" || process.argv.includes("--webm")
+    ? WEBM_CLIPS
+    : ["bench/booth2s.mp4", "bench/booth2s-aac.mp4", "bench/boomerang.mp4"];
 
 /** Web runs: CPU blend everywhere; `auto` direction costs motion analysis. */
 const webRuns = [];
@@ -88,22 +108,33 @@ const server = spawn("python3", ["-m", "http.server", String(PORT), "--bind", "1
 let browser;
 try {
   await waitForServer();
-  browser = await chromium.launch({
-    headless: true,
-    // --gpu: full chromium (headless=new) without SwiftShader pinning, so a
-    // machine with a real GPU actually uses it; the default headless shell
-    // cannot reach WebGPU/hardware codecs at all.
-    ...(WITH_GPU ? { channel: "chromium" } : {}),
-    args: WITH_GPU
-      ? ["--ignore-gpu-blocklist"]
-      : ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
-  });
+  if (BROWSER === "firefox") {
+    browser = await firefox.launch({ headless: true });
+  } else {
+    browser = await chromium.launch({
+      headless: true,
+      // --gpu: full chromium (headless=new) without SwiftShader pinning, so a
+      // machine with a real GPU actually uses it; the default headless shell
+      // cannot reach WebGPU/hardware codecs at all.
+      ...(WITH_GPU ? { channel: "chromium" } : {}),
+      args: WITH_GPU
+        ? ["--ignore-gpu-blocklist"]
+        : ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
+    });
+  }
   const page = await browser.newPage();
   page.on("pageerror", (err) => console.error(`[pageerror] ${err.message}`));
 
   const web = [];
   for (const run of webRuns) {
-    const query = new URLSearchParams({ ...run, iters: String(ITERS), autorun: "1" });
+    const query = new URLSearchParams({
+      ...run,
+      iters: String(ITERS),
+      autorun: "1",
+      latency: LATENCY,
+      ...(CODEC ? { codec: CODEC } : {}),
+      ...(HW === "off" ? { hwDecode: "0", hwEncode: "0" } : {}),
+    });
     process.stdout.write(`web ${run.clip} ${run.direction}/${run.backend} … `);
     await page.goto(`${BASE}/bench-video.html?${query}`);
     await page.waitForFunction(() => window.__benchResults !== null, null, {
@@ -121,8 +152,10 @@ try {
 
   let native = null;
   if (!SKIP_NATIVE) {
+    // The native CLI comparison always runs on the reference MP4 set so the
+    // column means the same thing for every --browser choice.
     native = [];
-    for (const clip of CLIPS) {
+    for (const clip of ["bench/booth2s.mp4", "bench/boomerang.mp4"]) {
       for (const direction of ["clockwise", "auto"]) {
         process.stdout.write(`native ${clip} ${direction} … `);
         const result = runNative(clip, direction);
@@ -137,9 +170,12 @@ try {
   mkdirSync(resultsDir, { recursive: true });
   const jsonPath = join(resultsDir, `web-${stamp}.json`);
   const payload = {
-    schema: 1,
+    schema: 2,
     date: new Date().toISOString(),
     iters: ITERS,
+    browser: BROWSER,
+    latency: LATENCY,
+    hw: HW,
     headless: !WITH_GPU,
     webMeta: web[0]?.meta ?? null,
     web: web.map((run) => ({
@@ -153,6 +189,7 @@ try {
       iterations: run.iters,
       decodeOnly: run.decodeOnly,
       blendOnly: run.blendOnly,
+      encodeOnly: run.encodeOnly,
       error: run.error,
     })),
     native,
@@ -175,22 +212,24 @@ function renderMarkdown(payload) {
   lines.push(
     `${payload.iters} iterations per run (median shown); ` +
       (payload.headless
-        ? "headless Chromium (software codecs; WebGPU adapter per meta)."
-        : "headed/hardware run."),
+        ? `headless ${payload.browser} (software codecs; WebGPU adapter per meta).`
+        : "headed/hardware run.") +
+      ` Encoder latency: ${payload.latency}, hardware preference: ${payload.hw}.`,
   );
   lines.push(`Browser: ${payload.webMeta?.userAgent ?? "unknown"}`);
   lines.push(`WebGPU: ${payload.webMeta?.webgpu ?? "unknown"}`);
   lines.push("");
-  lines.push("| clip | direction | backend | blend backend | median pairs/s | decode-only fps | blend-only fps |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| clip | direction | backend | blend backend | median pairs/s | decode-only fps | encode-only fps | blend-only fps |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const run of payload.web) {
     if (run.error) {
-      lines.push(`| ${run.clip} | ${run.direction} | ${run.backend} | — | ERROR: ${run.error} | — | — |`);
+      lines.push(`| ${run.clip} | ${run.direction} | ${run.backend} | — | ERROR: ${run.error} | — | — | — |`);
       continue;
     }
     lines.push(
       `| ${run.clip} | ${run.direction} | ${run.backend} | ${run.blender ?? "?"} | ` +
         `${run.medianFps.toFixed(1)} | ${run.decodeOnly ? run.decodeOnly.fps.toFixed(1) : "—"} | ` +
+        `${run.encodeOnly && !run.encodeOnly.error ? run.encodeOnly.fps.toFixed(1) : "—"} | ` +
         `${run.blendOnly ? run.blendOnly.fps.toFixed(1) : "—"} |`,
     );
   }

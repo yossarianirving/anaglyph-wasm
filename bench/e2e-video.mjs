@@ -148,6 +148,80 @@ const CASES = [
     },
   },
   {
+    // Hardware toggles: decoding + blending forced to software must still
+    // produce a valid conversion, and the report must say so.
+    name: "software paths",
+    file: sample("booth2s.mp4"),
+    unchecks: ["hwDecode", "webgpuBlend"],
+    expectAudio: false,
+    check(report) {
+      if (!/\(software-forced\)/.test(report.decoder)) {
+        throw new Error(`expected software-forced decoder, got "${report.decoder}"`);
+      }
+      if (report.blender !== "CPU (fallback)") {
+        throw new Error(`expected CPU blend fallback, got "${report.blender}"`);
+      }
+    },
+  },
+  {
+    // The wasm SIMD CPU blend must be byte-identical to its scalar
+    // reference (rounding, saturation, transparent-pixel rule), for every
+    // anaglyph type and including tail pixels past the 4-pixel groups.
+    name: "simd equals scalar",
+    async custom(page) {
+      const outcome = await page.evaluate(async () => {
+        const wasm = await import("/pkg/anaglyph_wasm.js");
+        await wasm.default();
+        if (!wasm.blend_is_simd()) {
+          return { ok: false, detail: "build does not use SIMD (blend_is_simd false)" };
+        }
+        let seed = 12345;
+        const rand = () => {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return seed % 256;
+        };
+        const fails = [];
+        for (const [w, h] of [[64, 8], [37, 7], [3, 1], [0, 4]]) {
+          const n = w * h * 4;
+          const l = new Uint8Array(n);
+          const r = new Uint8Array(n);
+          for (let i = 0; i < n; i++) {
+            l[i] = rand();
+            r[i] = rand();
+          }
+          // Transparent pairs every 5th pixel (alpha 0 on both eyes) and
+          // half-alpha pixels that are not transparent.
+          for (let p = 0; p < w * h; p += 5) {
+            l[p * 4 + 3] = 0;
+            r[p * 4 + 3] = 0;
+          }
+          for (let p = 1; p < w * h; p += 7) l[p * 4 + 3] = 128;
+          for (const type of ["color", "half-color", "grayscale", "optimized", "true"]) {
+            const simd = wasm.cpu_blend_debug(l, r, type, false);
+            const scalar = wasm.cpu_blend_debug(l, r, type, true);
+            if (simd.length !== scalar.length) {
+              fails.push(`${w}x${h} ${type}: length ${simd.length} != ${scalar.length}`);
+              continue;
+            }
+            for (let i = 0; i < simd.length; i++) {
+              if (simd[i] !== scalar[i]) {
+                fails.push(
+                  `${w}x${h} ${type}: byte ${i} (pixel ${i >> 2}) simd=${simd[i]} scalar=${scalar[i]}`,
+                );
+                break;
+              }
+            }
+          }
+        }
+        return {
+          ok: fails.length === 0,
+          detail: fails.length === 0 ? "SIMD == scalar on all sizes/types" : fails.join("; "),
+        };
+      });
+      return outcome;
+    },
+  },
+  {
     // Opus is not a legal MP4 audio codec (and the browser picked an MP4
     // output): the run must succeed video-only with an explanatory note.
     name: "opus in mp4",
@@ -256,8 +330,19 @@ try {
       { timeout: 30_000 },
     );
 
+    if (testCase.custom) {
+      const outcome = await testCase.custom(page);
+      if (!outcome.ok) fail(`${testCase.name}: ${outcome.detail}`);
+      console.log(`ok(${testCase.name}): ${outcome.detail}`);
+      await context.close();
+      continue;
+    }
+
     if (testCase.file) {
       await page.setInputFiles("#videoFile", testCase.file);
+    }
+    for (const id of testCase.unchecks ?? []) {
+      await page.uncheck(`#${id}`);
     }
     if (testCase.direction) {
       await page.selectOption("#videoDirection", testCase.direction);
