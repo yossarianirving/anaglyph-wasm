@@ -111,13 +111,14 @@ Reading the current baseline:
   the gap to Chrome largely closes — the report line `encoder:` shows which
   one was picked; the Acceleration checkboxes in `video.html` force software
   for comparison.
-- **WebGPU blend can lose to CPU in the full pipeline**: the CPU↔GPU copies
-  (YUV→RGBA decode copies, upload, `mapAsync` readback, RGBA→YUV encode
-  input) are attributed to `copy`/`blend`, and on SwiftShader (`--gpu` in
-  this container) they measure slower than the SIMD CPU loop. Only compare
-  `backend=cpu` vs `backend=auto` runs on real GPUs (`--gpu` on desktop
-  Chromium, or `video.html` on hardware); toggle WebGPU blending off in the
-  UI if the report shows WebGPU blend with lower fps than a CPU-blend run.
+- **WebGPU blend is off by default — CPU SIMD wins end to end.** Every pair
+  crosses CPU memory twice regardless (decoder `copyTo` out, `VideoFrame`
+  into the encoder), so GPU blending adds an upload + `mapAsync` readback
+  round-trip per pair without saving the copies it was meant to replace.
+  That holds on SwiftShader in this container **and on real desktop GPUs**
+  (user-reported: pipeline fps drops with the WebGPU checkbox on). The
+  toggle remains to A/B on your hardware: run one conversion with it off,
+  one on, and compare the report's fps.
 
 Native CLI (`-b cpu`, VAAPI h264 encode, wall-clock incl. process start):
 

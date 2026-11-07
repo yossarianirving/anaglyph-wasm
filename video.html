@@ -108,17 +108,19 @@
                             class="form-check-input"
                             type="checkbox"
                             id="webgpuBlend"
-                            checked
                         />
                         <label class="form-check-label" for="webgpuBlend"
-                            >WebGPU blending</label
+                            >WebGPU blending (experimental)</label
                         >
                     </div>
                     <div class="form-text">
                         Uncheck a box to force the software path if the
-                        hardware one looks broken (wrong colors, stalls) or
-                        slower &mdash; the report shows what was actually
-                        used.
+                        hardware one looks broken (wrong colors, stalls).
+                        WebGPU blending is off by default: frames must cross
+                        CPU memory for decode and encode anyway, so the GPU
+                        blend round-trip usually makes things
+                        &mdash;not faster. Compare both via the fps in the
+                        report.
                     </div>
                 </div>
 

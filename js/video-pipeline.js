@@ -295,10 +295,16 @@ function formatStageMs(stageMs) {
  *   motion (needs `createTracker`).
  * @param {string} [options.anaglyphType] wasm blend flavor name.
  * @param {{ decode?: boolean, encode?: boolean, webgpu?: boolean }}
- *   [options.acceleration] Hardware preferences, all default true. Turning
- *   one off forces the software path (`prefer-software` for the codecs, CPU
- *   blend for WebGPU) with a browser-chosen fallback when the forced hint is
- *   unsupported; useful on browsers whose hardware path is broken or slow.
+ *   [options.acceleration] Hardware preferences. `decode` and `encode`
+ *   default true; `webgpu` defaults **false**. Turning one off forces the
+ *   software path (`prefer-software` for the codecs, CPU blend for WebGPU)
+ *   with a browser-chosen fallback when the forced hint is unsupported;
+ *   useful on browsers whose hardware path is broken or slower. WebGPU
+ *   blending must be enabled explicitly because the CPU SIMD blend beats it
+ *   end-to-end in this architecture: every pair still crosses CPU memory
+ *   twice (decoder `copyTo` out, `VideoFrame` into the encoder), so the
+ *   blend's upload + `mapAsync` readback round-trip is pure added latency.
+ *   Measured slower with a real GPU as well (see BENCH.md).
  * @param {"quality" | "realtime"} [options.encoderLatencyMode] Encoder
  *   latency mode; "realtime" trades a little quality for significantly lower
  *   encode latency (and buffering stalls) on some browsers.
@@ -331,7 +337,8 @@ export async function convertVideoToAnaglyph(options) {
   } = options;
   const hwDecode = acceleration.decode !== false;
   const hwEncode = acceleration.encode !== false;
-  const webgpuBlend = acceleration.webgpu !== false;
+  // Opt-in: CPU SIMD blending wins end-to-end (no GPU round-trips); see BENCH.md.
+  const webgpuBlend = acceleration.webgpu === true;
 
   const startedAt = performance.now();
   const checkAbort = () => {
