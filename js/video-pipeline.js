@@ -248,6 +248,15 @@ function formatReversals(reversals) {
     .join("; ");
 }
 
+/** Render stage time totals compactly for the report table. */
+function formatStageMs(stageMs) {
+  return `copy ${Math.round(stageMs.copy)} ms · blend ${Math.round(
+    stageMs.blend,
+  )} ms · encode-wait ${Math.round(stageMs.encodeWait)} ms · decode-wait ${Math.round(
+    stageMs.decodeWait,
+  )} ms`;
+}
+
 /**
  * Convert a video file into an anaglyph video.
  *
@@ -298,6 +307,12 @@ export async function convertVideoToAnaglyph(options) {
   const pendingEntries = new Map();
   /** @type {object[]} reversals confirmed during the run (auto mode) */
   const reversalsFound = [];
+  /**
+   * Stage time totals in milliseconds, measured inside the processing
+   * steps (not wall-clock splits: stages overlap asynchronously). The
+   * report shows them; the bench page uses them for its breakdown.
+   */
+  const stageMs = { copy: 0, blend: 0, encodeWait: 0, decodeWait: 0 };
   /** 0-based index of the next decoded frame (the tracker's frame index). */
   let nextFrameIndex = 0;
 
@@ -424,12 +439,16 @@ export async function convertVideoToAnaglyph(options) {
     /** Blend an already-paired pair (owned RGBA buffers) and encode it. */
     async function emitPair(pair) {
       t0Us ??= pair.timestamp;
+      const blendStart = performance.now();
       const blended = await blender.blend(
         new Uint8Array(pair.left.rgba),
         new Uint8Array(pair.right.rgba),
       );
+      stageMs.blend += performance.now() - blendStart;
 
+      const waitStart = performance.now();
       await drainQueue(encoder, "encodeQueueSize", ENCODE_QUEUE_LIMIT);
+      stageMs.encodeWait += performance.now() - waitStart;
       checkAbort();
       const outFrame = new VideoFrame(blended, {
         format: "RGBA",
@@ -497,10 +516,12 @@ export async function convertVideoToAnaglyph(options) {
         frameChain = frameChain
           .then(async () => {
             entry.rgba = pool.acquire();
+            const copyStart = performance.now();
             await videoFrame.copyTo(new Uint8Array(entry.rgba), {
               format: "RGBA",
               rect: sourceRect,
             });
+            stageMs.copy += performance.now() - copyStart;
             videoFrame.close();
             pendingEntries.set(entry.index, entry);
             await handleStrategyResult(strategy.push(entry));
@@ -528,7 +549,9 @@ export async function convertVideoToAnaglyph(options) {
       checkAbort();
       if (fatalError) throw fatalError;
       decoder.decode(packet.toEncodedVideoChunk());
+      const waitStart = performance.now();
       await drainQueue(decoder, "decodeQueueSize", DECODE_QUEUE_LIMIT);
+      stageMs.decodeWait += performance.now() - waitStart;
     }
     await decoder.flush();
     await frameChain;
@@ -593,7 +616,11 @@ export async function convertVideoToAnaglyph(options) {
         width: source.codedWidth,
         height: source.codedHeight,
         frameBuffers: pool.maxHeld,
+        timings: formatStageMs(stageMs),
       },
+      // Machine-readable stage totals for the benchmark page/harness
+      // (`report.timings` above is the human-rendered sibling).
+      stageMs,
     };
   } finally {
     // Release codec and buffer resources on every exit path (success, error,

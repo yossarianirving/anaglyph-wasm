@@ -1,0 +1,351 @@
+<html>
+    <head>
+        <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            crossorigin="anonymous"
+        />
+        <title>Video pipeline benchmark</title>
+    </head>
+    <body>
+        <main class="container py-3" style="max-width: 60rem">
+            <p>
+                <a href="video.html">video converter</a> &middot;
+                <a href="bench.html">gif bench</a>
+            </p>
+            <h1>Video pipeline benchmark</h1>
+            <p class="text-muted">
+                Times the full WebCodecs pipeline (demux &rarr; decode &rarr;
+                pair &rarr; blend &rarr; encode &rarr; mux), plus isolated
+                decode-only and blend-only upper bounds. First iteration
+                includes warm-up costs; the harness reports medians.
+            </p>
+
+            <form id="benchForm" class="row g-2 align-items-end">
+                <div class="col-md-4">
+                    <label class="form-label" for="clip">Clip</label>
+                    <select class="form-select" id="clip">
+                        <option value="bench/booth2s.mp4">booth2s (5.7s)</option>
+                        <option value="bench/booth2s-aac.mp4">
+                            booth2s-aac (5.7s)
+                        </option>
+                        <option value="bench/boomerang.mp4">
+                            boomerang (11.3s)
+                        </option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="direction">Direction</label>
+                    <select class="form-select" id="direction">
+                        <option value="clockwise">clockwise</option>
+                        <option value="auto">auto</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="backend">Blend backend</label>
+                    <select class="form-select" id="backend">
+                        <option value="auto">auto (WebGPU if present)</option>
+                        <option value="cpu">cpu</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="iters">Iterations</label>
+                    <input
+                        class="form-control"
+                        id="iters"
+                        type="number"
+                        min="1"
+                        max="20"
+                        value="3"
+                    />
+                </div>
+                <div class="col-12 mt-2">
+                    <button type="submit" class="btn btn-primary" id="run">
+                        Run
+                    </button>
+                    <span id="status" class="ms-2 text-muted" aria-live="polite"></span>
+                </div>
+            </form>
+
+            <table
+                class="table table-sm table-striped mt-3"
+                id="results"
+                style="display: none"
+            ></table>
+            <pre id="json" class="bg-light p-2 small" style="display: none"></pre>
+        </main>
+        <script type="module">
+            import init, { MotionAnalyzer, Tracker, VideoBlender } from "./pkg/anaglyph_wasm.js";
+            import { convertVideoToAnaglyph } from "./js/video-pipeline.js";
+            import {
+                ALL_FORMATS,
+                BlobSource,
+                EncodedPacketSink,
+                Input,
+            } from "./vendor/mediabunny.mjs";
+
+            const statusEl = document.getElementById("status");
+            const resultsEl = document.getElementById("results");
+            const jsonEl = document.getElementById("json");
+
+            /** Collected result of the most recent run (Playwright reads this). */
+            window.__benchResults = null;
+
+            await init();
+
+            // Auto-start support for the automation harness:
+            //   bench-video.html?clip=bench/booth2s.mp4&iters=3&backend=cpu&autorun=1
+            const params = new URLSearchParams(location.search);
+            if (params.get("autorun")) {
+                if (params.get("clip")) document.getElementById("clip").value = params.get("clip");
+                if (params.get("direction")) document.getElementById("direction").value = params.get("direction");
+                if (params.get("backend")) document.getElementById("backend").value = params.get("backend");
+                if (params.get("iters")) document.getElementById("iters").value = params.get("iters");
+                runBenchmark();
+            }
+
+            document.getElementById("benchForm").addEventListener("submit", (e) => {
+                e.preventDefault();
+                runBenchmark();
+            });
+
+            async function fetchSample(url) {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`could not load ${url}`);
+                const blob = await response.blob();
+                return new File([blob], url.split("/").pop(), { type: blob.type });
+            }
+
+            /** createBlender for the pipeline; backend "cpu" skips the GPU probe. */
+            function makeCreateBlender(backend) {
+                return async (width, height, anaglyphType) => {
+                    const blender = await VideoBlender.new(
+                        width,
+                        height,
+                        anaglyphType,
+                        backend === "cpu" ? "cpu" : null,
+                    );
+                    return blender;
+                };
+            }
+
+            /** Same tracker factory as the production worker. */
+            async function makeTracker(width, height, reverse) {
+                const analyzer = MotionAnalyzer.new(width, height);
+                const tracker = new Tracker(reverse);
+                return {
+                    tracker: {
+                        push: (index, timeSecs, dx, reliable) =>
+                            tracker.push(index, timeSecs, dx, reliable),
+                        confirmedThrough: () => tracker.confirmed_through(),
+                        currentDirection: () => tracker.current_direction(),
+                        finish: () => tracker.finish(),
+                        takeReversals: () => tracker.take_reversals(),
+                    },
+                    observe: (frame) => ({
+                        dx: analyzer.observe_rgba(new Uint8Array(frame.rgba)),
+                        reliable: analyzer.is_reliable(),
+                    }),
+                };
+            }
+
+            /** Decode the whole clip, discard every frame: upper bound. */
+            async function benchDecode(file) {
+                const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+                try {
+                    const track = await input.getPrimaryVideoTrack();
+                    const config = await track.getDecoderConfig();
+                    let frames = 0;
+                    let decoderError = null;
+                    const decoder = new VideoDecoder({
+                        output(frame) {
+                            frames += 1;
+                            frame.close();
+                        },
+                        error(e) {
+                            decoderError = e;
+                        },
+                    });
+                    decoder.configure(config);
+                    const started = performance.now();
+                    const sink = new EncodedPacketSink(track);
+                    for await (const packet of sink.packets()) {
+                        if (decoderError) throw decoderError;
+                        decoder.decode(packet.toEncodedVideoChunk());
+                        while (decoder.decodeQueueSize > 32) {
+                            await new Promise((r) =>
+                                decoder.addEventListener("dequeue", r, { once: true }),
+                            );
+                        }
+                    }
+                    await decoder.flush();
+                    decoder.close();
+                    if (decoderError) throw decoderError;
+                    const seconds = (performance.now() - started) / 1e3;
+                    return { frames, seconds, fps: frames / seconds };
+                } finally {
+                    input.dispose();
+                }
+            }
+
+            /** Pure blend throughput on synthetic frames (no codecs). */
+            async function benchBlend(width, height, backend, frames) {
+                const blender = await VideoBlender.new(
+                    width,
+                    height,
+                    "color",
+                    backend === "cpu" ? "cpu" : null,
+                );
+                const a = new Uint8Array(width * height * 4).fill(120);
+                const b = new Uint8Array(width * height * 4).fill(90);
+                const started = performance.now();
+                for (let i = 0; i < frames; i++) await blender.blend(a, b);
+                const seconds = (performance.now() - started) / 1e3;
+                const gpu = blender.is_gpu();
+                blender.free();
+                return { frames, seconds, fps: frames / seconds, gpu };
+            }
+
+            async function runBenchmark() {
+                const clip = document.getElementById("clip").value;
+                const direction = document.getElementById("direction").value;
+                const backend = document.getElementById("backend").value;
+                const iters = parseInt(document.getElementById("iters").value, 10) || 3;
+                const runButton = document.getElementById("run");
+
+                runButton.disabled = true;
+                window.__benchResults = null;
+                const file = await fetchSample(clip);
+                const perIteration = [];
+                let lastError = null;
+
+                for (let i = 0; i < iters; i++) {
+                    statusEl.textContent = `iteration ${i + 1}/${iters}…`;
+                    try {
+                        const started = performance.now();
+                        const result = await convertVideoToAnaglyph({
+                            file,
+                            direction,
+                            anaglyphType: "color",
+                            createBlender: makeCreateBlender(backend),
+                            createTracker: direction.startsWith("auto")
+                                ? (w, h, reverse) => makeTracker(w, h, reverse)
+                                : undefined,
+                        });
+                        perIteration.push({
+                            fps: result.report.fps,
+                            seconds: result.report.seconds,
+                            frames: result.report.frames,
+                            sourceWidth: result.report.width,
+                            sourceHeight: result.report.height,
+                            blender: result.report.blender,
+                            encoder: result.report.encoder,
+                            decoder: result.report.decoder,
+                            stageMs: result.stageMs,
+                            outputBytes: result.blob.size,
+                            wallSeconds: (performance.now() - started) / 1e3,
+                        });
+                    } catch (err) {
+                        lastError = String(err && err.message ? err.message : err);
+                        break;
+                    }
+                }
+
+                let decodeOnly = null;
+                let blendOnly = null;
+                if (!lastError && perIteration.length > 0) {
+                    statusEl.textContent = "decode-only…";
+                    decodeOnly = await benchDecode(file);
+                    statusEl.textContent = "blend-only…";
+                    const dims = perIteration[0];
+                    blendOnly = await benchBlend(
+                        dims.sourceWidth & ~1,
+                        dims.sourceHeight & ~1,
+                        backend,
+                        Math.max(120, dims.frames || 180),
+                    );
+                }
+
+                const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+                let gpu = "no adapter";
+                if (adapter) {
+                    const info = adapter.info ?? (await adapter.requestAdapterInfo?.().catch(() => null));
+                    gpu = info ? `${info.vendor} ${info.architecture ?? ""}`.trim() : "adapter present";
+                }
+
+                window.__benchResults = {
+                    clip,
+                    direction,
+                    backend,
+                    iters: perIteration,
+                    decodeOnly,
+                    blendOnly,
+                    error: lastError,
+                    meta: {
+                        userAgent: navigator.userAgent,
+                        webgpu: gpu,
+                        deviceMemory: navigator.deviceMemory ?? null,
+                        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+                    },
+                };
+
+                renderTable(window.__benchResults);
+                statusEl.textContent = lastError ? `Failed: ${lastError}` : "done.";
+                runButton.disabled = false;
+            }
+
+            function renderTable(results) {
+                resultsEl.innerHTML = "";
+                resultsEl.style.display = "table";
+                const header = resultsEl.insertRow();
+                for (const title of [
+                    "iter",
+                    "pairs",
+                    "fps",
+                    "copy ms",
+                    "blend ms",
+                    "enc-wait ms",
+                    "dec-wait ms",
+                    "blend backend",
+                    "encoder",
+                    "out MB",
+                ]) {
+                    header.appendChild(document.createElement("th")).textContent = title;
+                }
+                results.iters.forEach((run, index) => {
+                    const row = resultsEl.insertRow();
+                    const cell = (value) => row.insertCell().textContent = value;
+                    cell(String(index + 1));
+                    cell(String(run.frames));
+                    cell(run.fps.toFixed(1));
+                    cell(String(Math.round(run.stageMs.copy)));
+                    cell(String(Math.round(run.stageMs.blend)));
+                    cell(String(Math.round(run.stageMs.encodeWait)));
+                    cell(String(Math.round(run.stageMs.decodeWait)));
+                    cell(run.blender);
+                    cell(run.encoder);
+                    cell((run.outputBytes / 1e6).toFixed(2));
+                });
+                if (results.decodeOnly) {
+                    const row = resultsEl.insertRow();
+                    row.insertCell().textContent = "—";
+                    row.insertCell().textContent = String(results.decodeOnly.frames);
+                    row.insertCell().textContent = results.decodeOnly.fps.toFixed(1);
+                    row.insertCell().colSpan = 5;
+                    row.insertCell().textContent = "decode-only";
+                }
+                if (results.blendOnly) {
+                    const row = resultsEl.insertRow();
+                    row.insertCell().textContent = "—";
+                    row.insertCell().textContent = String(results.blendOnly.frames);
+                    row.insertCell().textContent = results.blendOnly.fps.toFixed(1);
+                    row.insertCell().colSpan = 5;
+                    row.insertCell().textContent = `blend-only (${results.blendOnly.gpu ? "GPU" : "CPU"})`;
+                }
+                jsonEl.style.display = "block";
+                jsonEl.textContent = JSON.stringify(results, null, 2);
+            }
+        </script>
+    </body>
+</html>

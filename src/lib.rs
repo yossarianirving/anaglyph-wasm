@@ -253,10 +253,15 @@ impl VideoBlender {
     /// A static factory rather than an `async` constructor: wasm-bindgen
     /// deprecates async constructors because they emit invalid TypeScript.
     /// Use `await VideoBlender.new(...)`.
+    ///
+    /// `backend` optionally forces `"cpu"` (skips the GPU probe entirely);
+    /// anything else, including omission, prefers WebGPU with a CPU fallback.
+    /// Benchmarks use this to compare both paths in one build.
     pub async fn new(
         width: u32,
         height: u32,
         anaglyph_type: Option<String>,
+        backend: Option<String>,
     ) -> Result<VideoBlender, JsValue> {
         let a_type = match anaglyph_type.as_deref() {
             Some("color") => AnaglyphType::Color,
@@ -271,22 +276,29 @@ impl VideoBlender {
             .checked_mul(height as usize)
             .and_then(|p| p.checked_mul(4))
             .ok_or_else(|| JsValue::from_str("frame dimensions overflow"))?;
+        let force_cpu = backend.as_deref() == Some("cpu");
 
         #[cfg(feature = "gpu")]
-        let gpu = match anaglyph_rs::gpu::GpuBlender::new_async(width, height, matrix).await {
-            Ok(blender) => {
-                console::log_1(&"anaglyph: blending video frames on WebGPU".into());
-                Some(blender)
-            }
-            Err(e) => {
-                console::warn_1(
-                    &format!("anaglyph: WebGPU unavailable ({e}), using CPU blending").into(),
-                );
-                None
+        let gpu = if force_cpu {
+            console::log_1(&"anaglyph: CPU blending forced".into());
+            None
+        } else {
+            match anaglyph_rs::gpu::GpuBlender::new_async(width, height, matrix).await {
+                Ok(blender) => {
+                    console::log_1(&"anaglyph: blending video frames on WebGPU".into());
+                    Some(blender)
+                }
+                Err(e) => {
+                    console::warn_1(
+                        &format!("anaglyph: WebGPU unavailable ({e}), using CPU blending").into(),
+                    );
+                    None
+                }
             }
         };
         #[cfg(not(feature = "gpu"))]
         let gpu = {
+            let _ = force_cpu;
             console::warn_1(&"anaglyph: this build has no gpu feature, using CPU blending".into());
             None
         };
