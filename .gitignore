@@ -1,1 +1,3 @@
 /target
+node_modules
+bench/e2e-out-*.mp4

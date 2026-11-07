@@ -64,16 +64,23 @@ function handleAnaglyphSubmit(e) {
   var anaglyphType = e.data.anaglyphType;
   var x = offset.x;
   var y = offset.y;
-  var result = anaglyph.to_anaglyph(anaglyphType, x, y);
-  var anaglyph_image = new Uint8ClampedArray(result.get_image());
-  var anaglyphHeight = result.height;
-  var anaglyphWidth = result.width;
-  var canvas = new OffscreenCanvas(anaglyphWidth, anaglyphHeight);
-  var ctx = canvas.getContext("2d");
-  var imageData = new ImageData(anaglyph_image, anaglyphWidth, anaglyphHeight);
-  ctx.putImageData(imageData, 0, 0);
-  var imageBitmap = canvas.transferToImageBitmap();
-  postMessage({ type: "anaglyph-result", image: imageBitmap }, [imageBitmap]);
+  try {
+    var result = anaglyph.to_anaglyph(anaglyphType, x, y);
+    var anaglyph_image = new Uint8ClampedArray(result.get_image());
+    var anaglyphHeight = result.height;
+    var anaglyphWidth = result.width;
+    var canvas = new OffscreenCanvas(anaglyphWidth, anaglyphHeight);
+    var ctx = canvas.getContext("2d");
+    var imageData = new ImageData(anaglyph_image, anaglyphWidth, anaglyphHeight);
+    ctx.putImageData(imageData, 0, 0);
+    var imageBitmap = canvas.transferToImageBitmap();
+    postMessage({ type: "anaglyph-result", image: imageBitmap }, [imageBitmap]);
+  } catch (err) {
+    postMessage({
+      type: "anaglyph-error",
+      message: String(err && err.message ? err.message : err),
+    });
+  }
 }
 
 async function handleAnaglyphSubmitGif(e) {
