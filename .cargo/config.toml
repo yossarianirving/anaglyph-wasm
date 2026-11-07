@@ -1,0 +1,9 @@
+# WebAssembly SIMD powers the CPU blend loop (src/lib.rs blend_rgba_simd).
+# Every target browser supports wasm SIMD since 2021 (Chrome 91, Firefox 89,
+# Safari 16), but the wasm32-unknown-unknown target does not enable the
+# feature by default, so opt in here for all wasm builds of this crate.
+#
+# A/B the scalar loop with:
+#   RUSTFLAGS="-C target-cpu=mvp" npm run build:wasm
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
