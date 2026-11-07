@@ -1,7 +1,9 @@
 use anaglyph_rs::anaglyph::{
     left_right_to_anaglyph_offset, AnaglyphType, BlenderChoice, Offset, VideoDirection,
 };
-use anaglyph_rs::gif::{convert_gif_buffer_to_anaglyph, convert_gif_buffer_to_anaglyph_async};
+use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph;
+#[cfg(target_arch = "wasm32")]
+use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph_async;
 use image::{buffer::ConvertBuffer, imageops, RgbImage, RgbaImage};
 use wasm_bindgen::prelude::*;
 extern crate web_sys;
@@ -153,6 +155,9 @@ impl Anaglyph {
     /// available (the reason is logged to the console); without it, blending
     /// stays on the CPU. The method is async so the JS API is stable across
     /// both builds: callers must `await` the returned promise.
+    // wasm-only upstream: the async gif blend in anaglyph-rs exists solely
+    // for the browser build; native callers use the synchronous path.
+    #[cfg(target_arch = "wasm32")]
     pub async fn gif_to_anaglyph_async(
         &self,
         anaglyph_type: Option<String>,
