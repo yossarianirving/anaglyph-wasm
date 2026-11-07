@@ -33,6 +33,12 @@
                         <option value="bench/boomerang.mp4">
                             boomerang (11.3s)
                         </option>
+                        <option value="bench/booth2s-vp9.webm">
+                            booth2s VP9/WebM (Firefox-safe)
+                        </option>
+                        <option value="bench/boomerang-vp9.webm">
+                            boomerang VP9/WebM (Firefox-safe)
+                        </option>
                     </select>
                 </div>
                 <div class="col-md-3">
@@ -60,6 +66,52 @@
                         value="3"
                     />
                 </div>
+                <div class="col-md-4">
+                    <label class="form-label d-block">Codecs / latency</label>
+                    <div class="form-check form-check-inline">
+                        <input
+                            class="form-check-input"
+                            type="checkbox"
+                            id="hwDecode"
+                            checked
+                        />
+                        <label class="form-check-label" for="hwDecode"
+                            >HW decode</label
+                        >
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input
+                            class="form-check-input"
+                            type="checkbox"
+                            id="hwEncode"
+                            checked
+                        />
+                        <label class="form-check-label" for="hwEncode"
+                            >HW encode</label
+                        >
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <label class="form-check-label me-1" for="latency"
+                            >latency</label
+                        >
+                        <select class="form-select form-select-sm d-inline-block w-auto" id="latency">
+                            <option value="quality">quality</option>
+                            <option value="realtime">realtime</option>
+                        </select>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <label class="form-check-label me-1" for="codec"
+                            >codec</label
+                        >
+                        <select class="form-select form-select-sm d-inline-block w-auto" id="codec">
+                            <option value="">auto</option>
+                            <option value="avc">avc</option>
+                            <option value="vp9">vp9</option>
+                            <option value="vp8">vp8</option>
+                            <option value="av1">av1</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="col-12 mt-2">
                     <button type="submit" class="btn btn-primary" id="run">
                         Run
@@ -77,7 +129,7 @@
         </main>
         <script type="module">
             import init, { MotionAnalyzer, Tracker, VideoBlender } from "./pkg/anaglyph_wasm.js";
-            import { convertVideoToAnaglyph } from "./js/video-pipeline.js";
+            import { convertVideoToAnaglyph, planEncoder } from "./js/video-pipeline.js";
             import {
                 ALL_FORMATS,
                 BlobSource,
@@ -96,12 +148,17 @@
 
             // Auto-start support for the automation harness:
             //   bench-video.html?clip=bench/booth2s.mp4&iters=3&backend=cpu&autorun=1
+            // Optional: &hwDecode=0&hwEncode=0&latency=realtime
             const params = new URLSearchParams(location.search);
             if (params.get("autorun")) {
                 if (params.get("clip")) document.getElementById("clip").value = params.get("clip");
                 if (params.get("direction")) document.getElementById("direction").value = params.get("direction");
                 if (params.get("backend")) document.getElementById("backend").value = params.get("backend");
                 if (params.get("iters")) document.getElementById("iters").value = params.get("iters");
+                if (params.get("hwDecode")) document.getElementById("hwDecode").checked = params.get("hwDecode") !== "0";
+                if (params.get("hwEncode")) document.getElementById("hwEncode").checked = params.get("hwEncode") !== "0";
+                if (params.get("latency")) document.getElementById("latency").value = params.get("latency");
+                if (params.get("codec")) document.getElementById("codec").value = params.get("codec");
                 runBenchmark();
             }
 
@@ -119,12 +176,12 @@
 
             /** createBlender for the pipeline; backend "cpu" skips the GPU probe. */
             function makeCreateBlender(backend) {
-                return async (width, height, anaglyphType) => {
+                return async (width, height, anaglyphType, pipelineBackend) => {
                     const blender = await VideoBlender.new(
                         width,
                         height,
                         anaglyphType,
-                        backend === "cpu" ? "cpu" : null,
+                        backend === "cpu" || pipelineBackend === "cpu" ? "cpu" : null,
                     );
                     return blender;
                 };
@@ -207,11 +264,83 @@
                 return { frames, seconds, fps: frames / seconds, gpu };
             }
 
+            /**
+             * Pure encode throughput: feed synthetic-but-textured RGBA frames
+             * straight into the planned encoder (no demux/decode/copy/blend).
+             * Distinguishes a slow encoder from slow submission plumbing —
+             * Firefox runs its H.264 encoder in a GMP process and some per-
+             * frame cost there never shows up in the other stage timings.
+             */
+            async function benchEncode({ width, height, frameRate, acceleration, encoderLatencyMode, encoderCodec }, frames) {
+                const plan = await planEncoder(
+                    width,
+                    height,
+                    frameRate,
+                    acceleration.encode,
+                    encoderLatencyMode,
+                    encoderCodec,
+                );
+                if (!plan) return null;
+                const data = new Uint8Array(width * height * 4);
+                for (let i = 0; i < data.length; i += 4) {
+                    data[i] = (i * 7) & 0xff;
+                    data[i + 1] = (i * 13) & 0xff;
+                    data[i + 2] = (i * 29) & 0xff;
+                    data[i + 3] = 255;
+                }
+                let encodedFrames = 0;
+                let encoderError = null;
+                const encoder = new VideoEncoder({
+                    output() {
+                        encodedFrames += 1;
+                    },
+                    error(e) {
+                        encoderError = e;
+                    },
+                });
+                encoder.configure(plan.encoderConfig);
+                const started = performance.now();
+                for (let i = 0; i < frames; i++) {
+                    const frame = new VideoFrame(data, {
+                        format: "RGBA",
+                        codedWidth: width,
+                        codedHeight: height,
+                        timestamp: Math.round((i * 1e6) / frameRate),
+                        alphaMode: "discard",
+                    });
+                    encoder.encode(frame, { keyFrame: i % 60 === 0 });
+                    frame.close();
+                    while (encoder.encodeQueueSize > 16) {
+                        await new Promise((r) =>
+                            encoder.addEventListener("dequeue", r, { once: true }),
+                        );
+                    }
+                }
+                await encoder.flush();
+                encoder.close();
+                if (encoderError) throw encoderError;
+                const seconds = (performance.now() - started) / 1e3;
+                return {
+                    frames: encodedFrames,
+                    seconds,
+                    fps: encodedFrames / seconds,
+                    codec: plan.codec,
+                    accel: plan.accel,
+                };
+            }
+
             async function runBenchmark() {
                 const clip = document.getElementById("clip").value;
                 const direction = document.getElementById("direction").value;
                 const backend = document.getElementById("backend").value;
                 const iters = parseInt(document.getElementById("iters").value, 10) || 3;
+                const acceleration = {
+                    decode: document.getElementById("hwDecode").checked,
+                    encode: document.getElementById("hwEncode").checked,
+                    webgpu: backend !== "cpu",
+                };
+                const encoderLatencyMode = document.getElementById("latency").value;
+                const encoderCodec = document.getElementById("codec").value || null;
                 const runButton = document.getElementById("run");
 
                 runButton.disabled = true;
@@ -228,6 +357,9 @@
                             file,
                             direction,
                             anaglyphType: "color",
+                            acceleration,
+                            encoderLatencyMode,
+                            encoderCodec,
                             createBlender: makeCreateBlender(backend),
                             createTracker: direction.startsWith("auto")
                                 ? (w, h, reverse) => makeTracker(w, h, reverse)
@@ -239,6 +371,8 @@
                             frames: result.report.frames,
                             sourceWidth: result.report.width,
                             sourceHeight: result.report.height,
+                            output: result.report.output,
+                            rotation: result.report.rotation,
                             blender: result.report.blender,
                             encoder: result.report.encoder,
                             decoder: result.report.decoder,
@@ -254,6 +388,7 @@
 
                 let decodeOnly = null;
                 let blendOnly = null;
+                let encodeOnly = null;
                 if (!lastError && perIteration.length > 0) {
                     statusEl.textContent = "decode-only…";
                     decodeOnly = await benchDecode(file);
@@ -265,6 +400,22 @@
                         backend,
                         Math.max(120, dims.frames || 180),
                     );
+                    statusEl.textContent = "encode-only…";
+                    try {
+                        encodeOnly = await benchEncode(
+                            {
+                                width: dims.sourceWidth & ~1,
+                                height: dims.sourceHeight & ~1,
+                                frameRate: 30,
+                                acceleration,
+                                encoderLatencyMode,
+                                encoderCodec,
+                            },
+                            Math.max(120, dims.frames || 180),
+                        );
+                    } catch (err) {
+                        encodeOnly = { error: String(err && err.message ? err.message : err) };
+                    }
                 }
 
                 const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
@@ -278,9 +429,13 @@
                     clip,
                     direction,
                     backend,
+                    acceleration,
+                    encoderLatencyMode,
+                    encoderCodec,
                     iters: perIteration,
                     decodeOnly,
                     blendOnly,
+                    encodeOnly,
                     error: lastError,
                     meta: {
                         userAgent: navigator.userAgent,
@@ -342,6 +497,19 @@
                     row.insertCell().textContent = results.blendOnly.fps.toFixed(1);
                     row.insertCell().colSpan = 5;
                     row.insertCell().textContent = `blend-only (${results.blendOnly.gpu ? "GPU" : "CPU"})`;
+                }
+                if (results.encodeOnly && !results.encodeOnly.error) {
+                    const row = resultsEl.insertRow();
+                    row.insertCell().textContent = "—";
+                    row.insertCell().textContent = String(results.encodeOnly.frames);
+                    row.insertCell().textContent = results.encodeOnly.fps.toFixed(1);
+                    row.insertCell().colSpan = 5;
+                    row.insertCell().textContent = `encode-only (${results.encodeOnly.codec})`;
+                } else if (results.encodeOnly) {
+                    const row = resultsEl.insertRow();
+                    row.insertCell().textContent = "—";
+                    row.insertCell().colSpan = 3;
+                    row.insertCell().textContent = `encode-only failed: ${results.encodeOnly.error}`;
                 }
                 jsonEl.style.display = "block";
                 jsonEl.textContent = JSON.stringify(results, null, 2);
