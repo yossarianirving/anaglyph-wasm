@@ -278,23 +278,121 @@ function colorSpaceInit(colorSpace) {
   };
 }
 
+/** Extract a per-plane `{ offset, stride }` list from a `copyTo` return
+ * value. A spec-compliant result (byte count / `VideoFrameCopyToResult`)
+ * yields none; WebKit hands back exactly this array for native-plane
+ * copies instead of a byte count. */
+function rawPlaneResult(written) {
+  if (Array.isArray(written)) return written;
+  if (written && Array.isArray(written.bytesWritten)) return written.bytesWritten;
+  return null;
+}
+
+/**
+ * Validate a WebKit-style plane-descriptor result as a full coded
+ * NV12/I420 frame, returning the geometry to hand `yuvToRgba` (or `null`
+ * when the descriptors describe anything we cannot consume). The
+ * `uv.offset` ≥ last coded luma row requirement is what rules out a
+ * browser that honored `copyTo`'s rect: a buffer starting at the visible
+ * origin would shift the crop that raw mode applies in coded coordinates.
+ */
+function rawFrameGeometry(written, videoFrame, bufferBytes) {
+  const list = rawPlaneResult(written);
+  if (!list || list.length < 2) return null;
+  const fmt = String(videoFrame.format ?? "").toUpperCase();
+  const planar = fmt === "I420";
+  if (!planar && fmt !== "NV12") return null;
+  const planes = list.map((p) => ({ offset: p?.offset, stride: p?.stride }));
+  if (planes.some((p) => !Number.isFinite(p.offset) || !Number.isFinite(p.stride))) {
+    return null;
+  }
+  const { codedWidth, codedHeight } = videoFrame;
+  const chromaRows = (codedHeight + 1) >> 1;
+  const [y, uv, v] = planes;
+  const chromaStride = planar ? codedWidth >> 1 : codedWidth;
+  if (y.stride < codedWidth || uv.stride < chromaStride) return null;
+  if (uv.offset < y.stride * (codedHeight - 1)) return null;
+  if (planar) {
+    if (!v || v.stride < chromaStride) return null;
+    if (uv.offset + uv.stride * chromaRows > bufferBytes) return null;
+    if (v.offset + v.stride * chromaRows > bufferBytes) return null;
+  } else if (uv.offset + uv.stride * chromaRows > bufferBytes) {
+    return null;
+  }
+  return {
+    planar,
+    yOffset: y.offset,
+    yStride: y.stride,
+    uvOffset: uv.offset,
+    uvStride: uv.stride,
+    vOffset: planar ? v.offset : 0,
+  };
+}
+
+/** Y′C′B′C′→R′G′B′ matrix for the raw-plane path. Frames from WebKit
+ * typically report `matrix: "unspecified"`, so fall back to the
+ * resolution convention: HD content is BT.709, everything smaller BT.601. */
+function chooseYuvMatrix(colorSpace, codedWidth, codedHeight) {
+  switch (colorSpace?.matrix) {
+    case "bt709":
+    case "bt2020-ncl":
+      return true;
+    case "smpte170m":
+    case "bt470bg":
+    case "smpte240m":
+      return false;
+    default:
+      return Math.max(codedWidth, codedHeight) >= 720;
+  }
+}
+
 /**
  * Decide once, per conversion, how decoded frames become dense RGBA:
  *
  * - `"copyTo"` — the browser implements spec `copyTo` conversion to RGBA
  *   (Chromium, modern Firefox).
+ * - `"raw"` — `copyTo` only ever yields the frame's native NV12/I420
+ *   planes (whole coded frame, whatever format was asked for), described
+ *   by the per-plane `{offset, stride}` result WebKit returns. Those
+ *   planes go through the wasm `YuvFrameConverter` (convert + crop in one
+ *   pass, both buffers in wasm memory) — several times cheaper than the
+ *   canvas raster it replaces. Requires the `createYuvConverter`
+ *   injection; the probe also proves the converter's wasm-backed scratch
+ *   is an acceptable `copyTo` target. Without it, `"canvas"` wins.
  * - `"canvas"` — rasterize through `createImageBitmap` + `OffscreenCanvas`.
- *   WebKit (Safari, iOS, WebKitGTK) ignores `copyTo`'s `format` and hands
- *   back the frame's native NV12/I420 planes (with a non-standard
- *   `[{offset, stride}]` return); reading those as RGBA is the garbled
- *   gray output iOS users saw.
+ *   Reading WebKit's NV12 planes as if they were RGBA is the garbled gray
+ *   output iOS users saw, so anything the raw probe cannot validate ends
+ *   up here.
  *
- * Detection probes a 4x2 region: the return must report exactly
+ * Detection probes a 4x2 RGBA region: the return must report exactly
  * `4*4*2` bytes and the first pixel's alpha lane must be 255 — raw luma
- * planes fail both.
+ * planes fail both. The raw fallback then copies the whole coded frame at
+ * native format and validates the plane descriptors.
  */
-async function detectCopyMode(videoFrame) {
-  if (typeof videoFrame.copyTo !== "function") return "canvas";
+async function detectFrameCopy(videoFrame, createYuvConverter) {
+  /** RGBA probe failed (or copyTo threw): try native planes, else canvas. */
+  const probeRaw = async () => {
+    if (!createYuvConverter) return { mode: "canvas" };
+    const fmt = String(videoFrame.format ?? "").toUpperCase();
+    if (fmt !== "NV12" && fmt !== "I420") return { mode: "canvas" };
+    try {
+      // Probe through a throwaway converter: proves the wasm-backed
+      // scratch is an acceptable copyTo target before the run commits to
+      // the raw path.
+      const converter = createYuvConverter(
+        videoFrame.codedWidth * videoFrame.codedHeight * 2,
+        8,
+        8,
+      );
+      const buf = converter.planesView();
+      const written = await videoFrame.copyTo(buf);
+      const geo = rawFrameGeometry(written, videoFrame, buf.byteLength);
+      return geo ? { mode: "raw", planar: geo.planar } : { mode: "canvas" };
+    } catch {
+      return { mode: "canvas" };
+    }
+  };
+  if (typeof videoFrame.copyTo !== "function") return { mode: "canvas" };
   try {
     const probe = new Uint8Array(4 * 2 * 4);
     const written = await videoFrame.copyTo(probe, {
@@ -302,13 +400,13 @@ async function detectCopyMode(videoFrame) {
       rect: { x: 0, y: 0, width: 4, height: 2 },
     });
     const bytes = typeof written === "number" ? written : written?.bytesWritten;
-    if (bytes !== undefined && bytes !== probe.byteLength) return "canvas";
+    if (bytes !== undefined && bytes !== probe.byteLength) return probeRaw();
     // An opaque decoded frame converted to RGBA has alpha 255; NV12 bytes
     // dumped raw put luma/chroma values there instead.
-    if (probe[3] !== 255) return "canvas";
-    return "copyTo";
+    if (probe[3] !== 255) return probeRaw();
+    return { mode: "copyTo" };
   } catch {
-    return "canvas";
+    return probeRaw();
   }
 }
 
@@ -378,11 +476,14 @@ function formatReversals(reversals) {
 
 /** Render stage time totals compactly for the report table. */
 function formatStageMs(stageMs) {
+  const motion = stageMs.motion
+    ? ` · motion ${Math.round(stageMs.motion)} ms`
+    : "";
   return `copy ${Math.round(stageMs.copy)} ms · blend ${Math.round(
     stageMs.blend,
   )} ms · encode-wait ${Math.round(stageMs.encodeWait)} ms · decode-wait ${Math.round(
     stageMs.decodeWait,
-  )} ms`;
+  )} ms${motion}`;
 }
 
 /**
@@ -418,6 +519,15 @@ function formatStageMs(stageMs) {
  * @param {(width: number, height: number, reverse: boolean) => Promise<{tracker: object, observe: (frame: object) => {dx: number, reliable: boolean}}>} [options.createTracker]
  *   Factory for the auto-direction tracker + motion observer (wasm exports
  *   `Tracker` and `MotionAnalyzer` in the browser; tests pass stubs).
+ * @param {() => { planesView: () => Uint8Array, convert: (geo: object) => boolean, dstView: () => Uint8Array }}
+ *   [options.createYuvConverter] Factory for the `"raw"` frame-copy mode's
+ *   converter (wasm export `YuvFrameConverter`): `planesView()` hands out
+ *   the copyTo scratch (wasm-backed, so the browser writes planes straight
+ *   into wasm memory), `convert(geo)` produces dense RGBA for the visible
+ *   crop (`{ yOffset, yStride, uvOffset, uvStride, vOffset, x, y, width,
+ *   height, planar, bt709 }`, `false` when the geometry does not fit), and
+ *   `dstView()` reads it back. Without it, browsers that only expose
+ *   native planes fall back to canvas raster.
  * @param {(status: object) => void} [options.onProgress]
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<{ blob: Blob, report: object }>}
@@ -432,6 +542,7 @@ export async function convertVideoToAnaglyph(options) {
     encoderCodec = null,
     createBlender,
     createTracker,
+    createYuvConverter = null,
     onProgress = () => {},
     signal,
   } = options;
@@ -496,7 +607,7 @@ export async function convertVideoToAnaglyph(options) {
    * steps (not wall-clock splits: stages overlap asynchronously). The
    * report shows them; the bench page uses them for its breakdown.
    */
-  const stageMs = { copy: 0, blend: 0, encodeWait: 0, decodeWait: 0 };
+  const stageMs = { copy: 0, blend: 0, encodeWait: 0, decodeWait: 0, motion: 0 };
   /** 0-based index of the next decoded frame (the tracker's frame index). */
   let nextFrameIndex = 0;
 
@@ -540,7 +651,11 @@ export async function convertVideoToAnaglyph(options) {
      * @property {number} width
      * @property {number} height
      * @property {{ x: number, y: number, width: number, height: number }} copyRect
-     * @property {"copyTo" | "canvas"} copyMode
+     * @property {"copyTo" | "raw" | "canvas"} copyMode
+     * @property {{ planar: boolean, bt709: boolean, converter: object, crop: { x: number, y: number } } | null} raw
+     *   Raw-plane settings when `copyMode` is `"raw"`: the wasm converter
+     *   (plane scratch + dst live in wasm memory) and the visible-crop
+     *   origin in coded-frame coords.
      * @property {OffscreenCanvasRenderingContext2D|null} copyCtx
      * @property {{ blend: Function, is_gpu: () => boolean }} blender
      * @property {object} strategy
@@ -555,13 +670,41 @@ export async function convertVideoToAnaglyph(options) {
     let core = null;
 
     // Stages WebCodecs exposes only through callbacks are serialized onto
-    // promise chains: frame processing (decoder output) and muxing (encoder
-    // output). A callback error is latched and rethrown by the main flow.
+    // promise chains: frame copying (decoder output), pair emission
+    // (pairing + blend + encode-wait, which follows copy order), and muxing
+    // (encoder output). A callback error is latched and rethrown by the
+    // main flow.
     /** @type {Error | null} */
     let fatalError = null;
     let frameChain = Promise.resolve();
+    let emitChain = Promise.resolve();
     let muxChain = Promise.resolve();
     let videoChunks = 0;
+
+    // Copy-ahead gate: the copy chain runs ahead of emission so the
+    // browser's per-copyTo latency (a ~1.4 ms fixed round trip on WebKit at
+    // any size, BENCH.md "Engine notes") overlaps the previous frames'
+    // blend/encode-wait instead of serializing behind it. The gate bounds
+    // that lead to a few frames' worth of RGBA buffers.
+    const COPY_AHEAD_LIMIT = 3;
+    let copiesAhead = 0;
+    /** @type {Array<() => void>} */
+    const copyCapacityWaiters = [];
+    const waitForCopyCapacity = () =>
+      copiesAhead < COPY_AHEAD_LIMIT
+        ? Promise.resolve()
+        // Racing the abort signal keeps the chain moving (rejecting, to be
+        // latched) when cancellation or a latched emit error stops the
+        // releases that would otherwise wake the waiter.
+        : Promise.race([
+            new Promise((resolve) => copyCapacityWaiters.push(resolve)),
+            abortRace,
+          ]);
+    /** Free one copy-ahead slot (wakes a waiting copy step, if any). */
+    const releaseCopySlot = () => {
+      copiesAhead -= 1;
+      copyCapacityWaiters.shift()?.();
+    };
 
     /** Latch an error from a detached chain step (never reject the chain:
      * pending steps must still run their cleanup, and the main flow rethrows
@@ -619,11 +762,13 @@ export async function convertVideoToAnaglyph(options) {
 
       // How do decoded frames become dense RGBA in this browser? WebKit
       // silently hands back raw NV12/I420 planes for a "RGBA" copyTo; the
-      // probe catches that and every frame then goes through the canvas
-      // raster path instead. See detectCopyMode().
-      const copyMode = await detectCopyMode(videoFrame);
+      // probe catches that and prefers the wasm raw-plane path (falling
+      // back to canvas raster when the planes or converter are unusable).
+      // See detectFrameCopy().
+      const frameCopy = await detectFrameCopy(videoFrame, createYuvConverter);
       let copyCtx = null;
-      if (copyMode === "canvas") {
+      let raw = null;
+      if (frameCopy.mode === "canvas") {
         if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap !== "function") {
           throw new PipelineError(
             "this browser cannot convert decoded video frames to RGBA (no copyTo conversion, no OffscreenCanvas)",
@@ -632,6 +777,19 @@ export async function convertVideoToAnaglyph(options) {
         copyCtx = new OffscreenCanvas(width, height).getContext("2d", {
           willReadFrequently: true,
         });
+      } else if (frameCopy.mode === "raw") {
+        raw = {
+          converter: createYuvConverter(
+            videoFrame.codedWidth * videoFrame.codedHeight * 2,
+            width,
+            height,
+          ),
+          planar: frameCopy.planar,
+          bt709: chooseYuvMatrix(videoFrame.colorSpace, videoFrame.codedWidth, videoFrame.codedHeight),
+          // Raw copies always carry the whole coded frame, so the crop
+          // origin is the visible rect's position inside it.
+          crop: { x: vis.x, y: vis.y },
+        };
       }
 
       const plan = await planEncoder(
@@ -700,7 +858,19 @@ export async function convertVideoToAnaglyph(options) {
           throw new PipelineError(`direction "${direction}" needs a tracker factory`);
         }
         const auto = await createTracker(width, height, direction === "auto-reverse");
-        strategy = createPairStrategy(direction, auto);
+        // Time the wasm block-matching per frame: the auto mode's cost is
+        // almost exactly this, and it is the engine-spread term that fixed
+        // modes do not pay.
+        const timedAuto = {
+          ...auto,
+          observe: (frame) => {
+            const t = performance.now();
+            const result = auto.observe(frame);
+            stageMs.motion += performance.now() - t;
+            return result;
+          },
+        };
+        strategy = createPairStrategy(direction, timedAuto);
       } else {
         strategy = createPairStrategy(direction);
       }
@@ -711,7 +881,8 @@ export async function convertVideoToAnaglyph(options) {
         // Crop rect for both frame-copy paths, relative to the frame's
         // visible rect origin (the convention `copyTo`'s rect uses).
         copyRect: { x: 0, y: 0, width, height },
-        copyMode,
+        copyMode: frameCopy.mode,
+        raw,
         copyCtx,
         blender,
         strategy,
@@ -801,57 +972,116 @@ export async function convertVideoToAnaglyph(options) {
         // Every frame is copied to an owned RGBA buffer immediately and the
         // VideoFrame closed: held-back (auto) frames would otherwise pin
         // decoder-owned memory, and motion analysis + blending both need
-        // dense pixels. All processing runs serialized on frameChain, so a
-        // frame's buffer always outlives the pairs that reference it, and
-        // the first frame also plans the rest of the pipeline.
+        // dense pixels. Copying is serialized on frameChain (the raw-mode
+        // converter and canvas scratch are single-use) and runs *ahead* of
+        // emission — bounded by COPY_AHEAD_LIMIT — so the browser's
+        // per-copyTo latency overlaps the previous frames' blend and
+        // encode-wait instead of serializing behind it; emission follows
+        // copy order on emitChain, so a frame's buffer always outlives the
+        // pairs that reference it and the first frame plans the rest of
+        // the pipeline.
         const entry = {
           index: nextFrameIndex++,
           timestamp: videoFrame.timestamp,
           duration: videoFrame.duration ?? 0,
           colorSpace: colorSpaceInit(videoFrame.colorSpace),
           rgba: null,
+          // Holds a copy-ahead slot until emission (or its failure) frees
+          // it, whether or not the emit step succeeds.
+          counted: false,
         };
-        frameChain = frameChain
+        const copied = frameChain.then(async () => {
+          core ??= await planFromFrame(videoFrame);
+          await waitForCopyCapacity();
+          entry.rgba = pool.acquire();
+          const copyStart = performance.now();
+          const target = new Uint8Array(entry.rgba);
+          if (core.copyMode === "canvas") {
+            await extractViaCanvas(videoFrame, target, core.copyCtx, core.copyRect);
+          } else if (core.copyMode === "raw") {
+            // Native NV12/I420 planes (whole coded frame), converted and
+            // cropped to dense RGBA by wasm in one pass. Plane geometry
+            // comes from this frame's own descriptor list; any deviation
+            // from the validated probe shape fails loudly rather than
+            // producing shifted or garbled pixels. Re-fetch planesView()
+            // (the view detaches if wasm memory grew) and consume
+            // dstView() immediately.
+            const r = core.raw;
+            const planes = r.converter.planesView();
+            const written = await videoFrame.copyTo(planes);
+            const geo = rawFrameGeometry(written, videoFrame, planes.byteLength);
+            if (!geo || geo.planar !== r.planar) {
+              throw new PipelineError("decoder frame planes changed mid-stream");
+            }
+            const ok = r.converter.convert({
+              ...geo,
+              x: r.crop.x,
+              y: r.crop.y,
+              width: core.width,
+              height: core.height,
+              bt709: r.bt709,
+            });
+            if (!ok) {
+              throw new PipelineError("raw frame crop does not fit the decoded planes");
+            }
+            // Copy the converted RGBA into the pooled frame buffer.
+            target.set(r.converter.dstView());
+          } else {
+            const written = await videoFrame.copyTo(target, {
+              format: "RGBA",
+              rect: core.copyRect,
+            });
+            // copyTo returns bytes written: a number in older implementations,
+            // a VideoFrameCopyToResult ({ length, bytesWritten }) now; some
+            // builds resolve undefined and rely on throwing for short copies.
+            const bytes =
+              typeof written === "number"
+                ? written
+                : (written?.bytesWritten ?? entry.rgba.byteLength);
+            if (bytes !== entry.rgba.byteLength) {
+              throw new PipelineError(
+                `decoder frame copy wrote ${bytes} of ${entry.rgba.byteLength} expected bytes`,
+              );
+            }
+          }
+          stageMs.copy += performance.now() - copyStart;
+          videoFrame.close();
+          entry.counted = true;
+          copiesAhead += 1;
+        });
+        // Neither chain ever rejects: a step latches instead so later
+        // frames still run and close their VideoFrames, and the main flow
+        // rethrows fatalError.
+        frameChain = copied.catch((e) => {
+          // Planning and copy failures land here; the frame is closed for
+          // the emit chain's sake, entry.rgba stays null so emission skips.
+          latch(e);
+          try {
+            videoFrame.close();
+          } catch {
+            /* already closed */
+          }
+        });
+        emitChain = emitChain
           .then(async () => {
-            core ??= await planFromFrame(videoFrame);
-            entry.rgba = pool.acquire();
-            const copyStart = performance.now();
-            const target = new Uint8Array(entry.rgba);
-            if (core.copyMode === "canvas") {
-              await extractViaCanvas(videoFrame, target, core.copyCtx, core.copyRect);
-            } else {
-              const written = await videoFrame.copyTo(target, {
-                format: "RGBA",
-                rect: core.copyRect,
-              });
-              // copyTo returns bytes written: a number in older implementations,
-              // a VideoFrameCopyToResult ({ length, bytesWritten }) now; some
-              // builds resolve undefined and rely on throwing for short copies.
-              const bytes =
-                typeof written === "number"
-                  ? written
-                  : (written?.bytesWritten ?? entry.rgba.byteLength);
-              if (bytes !== entry.rgba.byteLength) {
-                throw new PipelineError(
-                  `decoder frame copy wrote ${bytes} of ${entry.rgba.byteLength} expected bytes`,
-                );
+            await copied;
+            try {
+              if (entry.rgba) {
+                pendingEntries.set(entry.index, entry);
+                await handleStrategyResult(core.strategy.push(entry));
+              }
+            } finally {
+              if (entry.counted) {
+                entry.counted = false;
+                releaseCopySlot();
               }
             }
-            stageMs.copy += performance.now() - copyStart;
-            videoFrame.close();
-            pendingEntries.set(entry.index, entry);
-            await handleStrategyResult(core.strategy.push(entry));
           })
           .catch((e) => {
-            // Planning, copy failures and cancellation land here; pending
-            // steps still run (closing their VideoFrame), the main flow
-            // rethrows.
+            // Strategy or emit failure: the slot accounting above already
+            // ran (finally), so the copy chain keeps flowing to its own
+            // latched end.
             latch(e);
-            try {
-              videoFrame.close();
-            } catch {
-              /* already closed */
-            }
           });
       },
       error(e) {
@@ -875,6 +1105,7 @@ export async function convertVideoToAnaglyph(options) {
     // (and with it the worker's busy guard).
     await withAbort(decoder.flush());
     await withAbort(frameChain);
+    await withAbort(emitChain);
     if (fatalError) throw fatalError;
 
     // End of stream: the strategy commits every held-back pair (the last
@@ -927,7 +1158,12 @@ export async function convertVideoToAnaglyph(options) {
         encoder: `${core.plan.codec} (${accelLabel(core.plan.accel)})`,
         decoder: `${source.codecString} (${decoderMode})`,
         blender: core.blender.is_gpu() ? "WebGPU" : "CPU (fallback)",
-        frameCopy: core.copyMode === "canvas" ? "canvas raster" : "copyTo",
+        frameCopy:
+          core.copyMode === "canvas"
+            ? "canvas raster"
+            : core.copyMode === "raw"
+              ? `${core.raw.planar ? "I420" : "NV12"} \u2192 RGBA (wasm)`
+              : "copyTo",
         output: `${core.width}\u00d7${core.height}`,
         rotation: core.rotationNote,
         direction: core.strategy.auto

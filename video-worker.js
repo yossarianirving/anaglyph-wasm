@@ -1,4 +1,4 @@
-import init, { MotionAnalyzer, Tracker, VideoBlender } from "./pkg/anaglyph_wasm.js";
+import init, { MotionAnalyzer, Tracker, VideoBlender, YuvFrameConverter } from "./pkg/anaglyph_wasm.js";
 import { convertVideoToAnaglyph } from "./js/video-pipeline.js";
 
 /** @type {AbortController | null} */
@@ -43,6 +43,32 @@ async function startConversion(data) {
       // `backend` is "cpu" when the WebGPU blend toggle is off.
       createBlender: (width, height, anaglyphType, backend) =>
         VideoBlender.new(width, height, anaglyphType, backend ?? null),
+      // WebKit's copyTo hands back native NV12/I420 planes; this wasm
+      // converter turns them (plus the visible-crop geometry) into dense
+      // RGBA in place of a canvas raster. Both buffers live in wasm memory
+      // so the ~1.4 ms/frame copyTo carries the pixels straight in, and
+      // `convert` speaks a plain geometry object on this side of the glue.
+      createYuvConverter: (planeBytes, width, height) => {
+        const c = new YuvFrameConverter(planeBytes, width, height);
+        return {
+          planesView: () => c.planesView(),
+          convert: (g) =>
+            c.convert(
+              g.yOffset,
+              g.yStride,
+              g.uvOffset,
+              g.uvStride,
+              g.vOffset,
+              g.x,
+              g.y,
+              g.width,
+              g.height,
+              g.planar,
+              g.bt709,
+            ),
+          dstView: () => c.dstView(),
+        };
+      },
       createTracker: async (width, height, reverse) => {
         // wasm-bindgen keeps Rust snake_case on the JS surface; pairing.js
         // speaks camelCase, so adapt here (the glue layer owns wasm shapes).

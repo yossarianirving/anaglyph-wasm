@@ -12,6 +12,7 @@ edition = "2021"
 # convert_gif_buffer_to_anaglyph_async with a CPU fallback.
 anaglyph-rs = { path = "../anaglyph-rs" }
 image = { version = "0.25.5", features = ["gif"] }
+js-sys = "0.3"
 wasm-bindgen = "0.2.92"
 wasm-bindgen-futures = "0.4"
 

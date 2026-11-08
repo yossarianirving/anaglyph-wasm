@@ -49,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "anaglyph-rs",
  "image",
+ "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

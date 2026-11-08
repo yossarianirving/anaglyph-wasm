@@ -6,6 +6,8 @@ use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph;
 use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph_async;
 use image::{buffer::ConvertBuffer, imageops, RgbImage, RgbaImage};
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use js_sys::Uint8Array;
 extern crate web_sys;
 use image::ImageReader;
 use std::io::Cursor;
@@ -574,14 +576,13 @@ use anaglyph_rs::motion::{trend_to_direction, MotionSample};
 
 /// Per-frame camera drift estimator for auto-direction pairing. Wraps the
 /// native `MotionEstimator` and consumes the same dense RGBA frames the
-/// pipeline already produces for [`VideoBlender`], so decoded frames feed
-/// motion analysis without a separate format conversion on the JS side.
+/// pipeline already produces for [`VideoBlender`]: the estimator downsamples
+/// RGBA directly (identical luma to the RGB24 path, verified in anaglyph-rs
+/// tests), so there is no packing pass per frame.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct MotionAnalyzer {
     inner: anaglyph_rs::motion::MotionEstimator,
-    /// Reusable dense RGB24 buffer; the estimator expects RGB24.
-    rgb: Vec<u8>,
     frame_len: usize,
     last_reliable: bool,
 }
@@ -593,14 +594,13 @@ impl MotionAnalyzer {
     /// [`Self::observe_rgba`] call must supply exactly `width * height * 4`
     /// bytes.
     pub fn new(width: u32, height: u32) -> Result<MotionAnalyzer, JsValue> {
-        let rgb_len = (width as usize)
+        let frame_len = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|p| p.checked_mul(3))
+            .and_then(|p| p.checked_mul(4))
             .ok_or_else(|| JsValue::from_str("frame dimensions overflow"))?;
         Ok(MotionAnalyzer {
             inner: anaglyph_rs::motion::MotionEstimator::new(width as usize, height as usize),
-            rgb: vec![0; rgb_len],
-            frame_len: rgb_len / 3 * 4,
+            frame_len,
             last_reliable: false,
         })
     }
@@ -615,8 +615,7 @@ impl MotionAnalyzer {
                 "frame size mismatch: expected width*height*4 bytes",
             ));
         }
-        pack_rgb24(&mut self.rgb, rgba);
-        let sample = self.inner.observe(&self.rgb);
+        let sample = self.inner.observe_rgba(rgba);
         self.last_reliable = sample.reliable;
         Ok(sample.dx)
     }
@@ -626,38 +625,6 @@ impl MotionAnalyzer {
     /// or the very first frame).
     pub fn is_reliable(&self) -> bool {
         self.last_reliable
-    }
-}
-
-/// Pack dense RGBA into dense RGB24 (drop alpha). Uses wasm SIMD when the
-/// build enables `simd128`: 4 pixels per register, one shuffle plus two
-/// partial lane stores, remainder scalar. Byte-identical to the scalar loop.
-#[cfg(target_arch = "wasm32")]
-fn pack_rgb24(out: &mut [u8], rgba: &[u8]) {
-    let count = rgba.len() / 4;
-
-    #[cfg(target_feature = "simd128")]
-    {
-        use core::arch::wasm32::*;
-        for i in 0..count / 4 {
-            let o = i * 16;
-            let pixels = unsafe { v128_load(rgba.as_ptr().add(o) as *const v128) };
-            // RGBA×4 -> [R G B]×4 in the low 12 bytes.
-            let packed =
-                u8x16_shuffle::<0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0>(pixels, pixels);
-            unsafe {
-                let dst = out.as_mut_ptr().add(i * 12);
-                v128_store64_lane::<0>(packed, dst as *mut u64);
-                v128_store32_lane::<2>(packed, dst.add(8) as *mut u32);
-            }
-        }
-    }
-
-    let done = count / 4 * 4;
-    let mut j = done * 3;
-    for chunk in rgba[done * 4..].chunks_exact(4) {
-        out[j..j + 3].copy_from_slice(&chunk[..3]);
-        j += 3;
     }
 }
 
@@ -743,5 +710,116 @@ fn direction_bit(direction: VideoDirection) -> f64 {
     match direction {
         VideoDirection::Clockwise => 1.0,
         VideoDirection::CounterClockwise => 0.0,
+    }
+}
+
+/// Zero-copy raw 4:2:0 → RGBA converter for the WebKit frame path.
+///
+/// WebKit's `VideoFrame.copyTo` ignores the requested output format and
+/// hands back native NV12/I420 planes (described by `[{offset, stride}]`
+/// results), and every copyTo costs ~1.4 ms of fixed round-trip latency
+/// whatever the destination size (BENCH.md "Engine notes"). To keep the
+/// pixel work around that floor minimal, both buffers live in wasm memory:
+/// `planes_view()` is the copyTo target (the browser memcpy's planes
+/// straight into wasm memory), `convert()` turns them into dense RGBA
+/// cropped to the visible region, and `dst_view()` reads the result — no
+/// bindgen slice copies in either direction.
+///
+/// The returned views alias wasm linear memory. They stay valid only
+/// until the next call that can grow memory, so callers must re-fetch
+/// `planes_view()` every frame and consume `dst_view()` immediately
+/// (before the next `convert`).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct YuvFrameConverter {
+    planes: Vec<u8>,
+    dst: Vec<u8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl YuvFrameConverter {
+    /// `plane_bytes` bounds the raw plane buffer (a coded 4:2:0 frame with
+    /// slack for padding: `codedWidth * codedHeight * 2`); `width` ×
+    /// `height` is the RGBA output (the even visible crop, fixed for the
+    /// whole conversion).
+    #[wasm_bindgen(constructor)]
+    pub fn new(plane_bytes: u32, width: u32, height: u32) -> Result<YuvFrameConverter, JsValue> {
+        let dst_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|p| p.checked_mul(4))
+            .ok_or_else(|| JsValue::from_str("frame dimensions overflow"))?;
+        Ok(YuvFrameConverter {
+            planes: vec![0; plane_bytes as usize],
+            dst: vec![0; dst_len],
+        })
+    }
+
+    /// Scratch buffer for one raw frame: hand this to `copyTo` (no format
+    /// option). Re-fetch every frame; the view detaches if memory grows.
+    #[wasm_bindgen(js_name = planesView)]
+    pub fn planes_view(&self) -> Uint8Array {
+        // SAFETY: view into wasm memory over the planes buffer; nothing
+        // mutates or reallocates it until the next `convert`, and callers
+        // re-fetch it each frame.
+        unsafe { Uint8Array::view(&self.planes) }
+    }
+
+    /// Convert the planes last copied into `planesView()` to dense RGBA
+    /// (`dstView`). `planar` selects I420 (else NV12); `bt709` selects the
+    /// BT.709 matrix over BT.601. Returns `false` (dst untouched) when the
+    /// geometry does not fit the plane bytes or output size.
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn convert(
+        &mut self,
+        y_offset: u32,
+        y_stride: u32,
+        uv_offset: u32,
+        uv_stride: u32,
+        v_offset: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        planar: bool,
+        bt709: bool,
+    ) -> bool {
+        use anaglyph_rs::yuv::{RawYuvFormat, RawYuvLayout, YuvStandard};
+        let layout = RawYuvLayout {
+            format: if planar {
+                RawYuvFormat::I420
+            } else {
+                RawYuvFormat::Nv12
+            },
+            y_offset: y_offset as usize,
+            y_stride: y_stride as usize,
+            uv_offset: uv_offset as usize,
+            uv_stride: uv_stride as usize,
+            v_offset: v_offset as usize,
+            x: x as usize,
+            y: y as usize,
+            width: width as usize,
+            height: height as usize,
+        };
+        anaglyph_rs::yuv::yuv420_to_rgba(
+            &mut self.dst,
+            &self.planes,
+            &layout,
+            if bt709 {
+                YuvStandard::Bt709
+            } else {
+                YuvStandard::Bt601
+            },
+        )
+    }
+
+    /// Converted RGBA output (`width * height * 4` bytes). Consume before
+    /// the next `convert`; the view detaches if memory grows.
+    #[wasm_bindgen(js_name = dstView)]
+    pub fn dst_view(&self) -> Uint8Array {
+        // SAFETY: view into wasm memory over the dst buffer; fixed size
+        // since construction, and callers consume it immediately.
+        unsafe { Uint8Array::view(&self.dst) }
     }
 }
