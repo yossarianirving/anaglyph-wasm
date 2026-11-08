@@ -4,10 +4,12 @@
  * Per frame three GPU passes replace the wasm block matcher's CPU copy +
  * match entirely:
  *
- * 1. `LUMA_SHADER` fragment pass: imported VideoFrame -> full-size
- *    R32Float luma texture (x255, BT.601 weights). This is the only pass
- *    that can read `texture_external`, and it runs as part of the frame's
- *    normal submission — no CPU copy.
+ * 1. `makeLumaShader` fragment pass: decoded frame -> full-size R32Float
+ *    luma texture (x255, BT.601 weights). Source mode `external` imports
+ *    the VideoFrame as `texture_external` inside the pass — the only pass
+ *    that can, and it runs as part of the frame's normal submission, no
+ *    CPU copy. Source mode `texture2d` (Firefox) samples the staged view
+ *    `submit()` receives from the pipeline's canvas stager.
  * 2. `BOX_DOWNSAMPLE` compute: exact box average into the 256-wide
  *    analysis texture (same integer ranges as motion.rs), double-buffered.
  * 3. `makeSadCompute` compute: per-block best subpixel shift / quality
@@ -25,7 +27,7 @@
  * matching readback FIFO.
  */
 
-import { LUMA_SHADER, BOX_DOWNSAMPLE, makeSadCompute } from "./shaders.js";
+import { makeLumaShader, BOX_DOWNSAMPLE, makeSadCompute } from "./shaders.js";
 import { makeImporter } from "./external.js";
 
 /** Mirror of the motion.rs constants. */
@@ -132,8 +134,11 @@ export class GpuMotion {
    *   source window in image uv units (same uniform as the blend pass).
    * @param {0 | 1} [flip] external-texture y flip from the orientation
    *   calibration (see `probeExternalOrientation`).
+   * @param {"external" | "texture2d"} [source] luma-pass frame source
+   *   mode; `texture2d` for engines staging frames via
+   *   `copyExternalImageToTexture` (submit() then takes a staged view).
    */
-  constructor(device, { width, height }, crop, flip = 0) {
+  constructor(device, { width, height }, crop, flip = 0, source = "external") {
     this.device = device;
     this.crop = crop;
     this.geo = analysisGeometry(width, height);
@@ -221,7 +226,7 @@ export class GpuMotion {
         : null;
 
     // Pipelines.
-    const lumaMod = device.createShaderModule({ code: LUMA_SHADER });
+    const lumaMod = device.createShaderModule({ code: makeLumaShader(source) });
     const boxMod = device.createShaderModule({ code: BOX_DOWNSAMPLE });
     const sadMod = device.createShaderModule({ code: makeSadCompute(tileW, MIN_BLOCK_VARIANCE) });
     this.lumaPipe = device.createRenderPipeline({
@@ -323,15 +328,22 @@ export class GpuMotion {
    * callback (the VideoFrame must still be open). Fire-and-forget: the
    * matching sample comes out of `nextSample()` in the same order.
    *
+   * In `texture2d` mode the pipeline stages the frame itself
+   * (drawImage + copyExternalImageToTexture) and passes the resulting
+   * texture view; the VideoFrame is then only a fallback import target.
+   *
    * @param {VideoFrame} frame
+   * @param {GPUTextureView | null} [stagedView] pre-staged frame texture
+   *   view (`texture2d` source mode).
    */
-  submit(frame) {
+  submit(frame, stagedView = null) {
     if (this._closed) return;
     const device = this.device;
     const encoder = device.createCommandEncoder({ label: "motion" });
 
-    // 1. Luma -> full-size r32float. The frame is imported inside the
-    // render pass: external-texture views cannot leave it.
+    // 1. Luma -> full-size r32float. In external mode the frame is
+    // imported inside the render pass (views cannot leave it); in
+    // texture2d mode the staged view is bound directly.
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -342,7 +354,7 @@ export class GpuMotion {
         },
       ],
     });
-    const view = this._import(pass, frame);
+    const view = stagedView ?? this._import(pass, frame);
     pass.setPipeline(this.lumaPipe);
     pass.setBindGroup(0, device.createBindGroup({
       layout: this.lumaPipe.getBindGroupLayout(0),

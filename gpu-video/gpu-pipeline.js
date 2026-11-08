@@ -8,7 +8,14 @@
  *        │                                                                    │
  *   mux (mediabunny) ◄── VideoEncoder ◄── canvas capture ◄── blend fragment ──┘
  *
- * No video pixel ever crosses the CPU/GPU boundary: decoded VideoFrames are
+ * Two frame-source modes share every other stage: `external` imports
+ * decoded VideoFrames directly as `texture_external` (Chrome, Safari/iOS);
+ * `canvas` (Firefox, which lacks `importExternalTexture`) stages each
+ * frame through a 2D canvas `drawImage` + `copyExternalImageToTexture`
+ * into `texture_2d` textures sampled by shader variants of the same
+ * passes. See shaders.js + external.js.
+ *
+ * In external mode no video pixel ever crosses the CPU/GPU boundary: decoded VideoFrames are
  * imported as external textures for the blend fragment shader and for the
  * motion passes (a luma fragment pass, an exact box downsample, and a SAD
  * compute kernel mirroring anaglyph-rs `motion.rs` — see shaders.js and
@@ -43,8 +50,8 @@ import {
 } from "../vendor/mediabunny.mjs";
 import { createPairStrategy } from "../js/pairing.js";
 import { DirectionTracker } from "./tracker.js";
-import { BLEND_SHADER, BLIT_SHADER } from "./shaders.js";
-import { makeImporter, probeExternalOrientation } from "./external.js";
+import { makeBlendShader, BLIT_SHADER } from "./shaders.js";
+import { makeImporter, probeExternalOrientation, supportsExternalImport } from "./external.js";
 import { GpuMotion } from "./motion.js";
 
 /** Encoded chunks handed to the decoder before it has drained. */
@@ -486,6 +493,11 @@ export async function convertVideoToAnaglyphGpu(options) {
   const context = gpu ?? (await createGpuContext());
   const device = context.device;
   const importExternal = makeImporter(device);
+  /** How frames reach the shaders: `importExternalTexture` where the
+   * engine has it (Chrome, Safari/iOS); canvas `drawImage` +
+   * `copyExternalImageToTexture` staged `texture_2d` sources otherwise
+   * (Firefox). The external path is untouched by the fallback mode. */
+  const sourceMode = supportsExternalImport(device) ? "external" : "canvas";
 
   const source = await inspectSource(file);
   /** @type {VideoDecoder | null} */
@@ -539,7 +551,13 @@ export async function convertVideoToAnaglyphGpu(options) {
     *   audioSource: EncodedAudioPacketSource | null, output: Output,
     *   videoSource: EncodedVideoPacketSource, rotationNote: string,
     *   strategy: object, motion: GpuMotion | null,
-    *   captureMode: "canvas" | "bytes", yFlip: 0 | 1, canvas: OffscreenCanvas | null,
+    *   captureMode: "canvas" | "bytes", yFlip: 0 | 1,
+    *   sourceMode: "external" | "canvas",
+    *   stageLeft: ((VideoFrame) => GPUTextureView) | null,
+    *   stageRight: ((VideoFrame) => GPUTextureView) | null,
+    *   stageMotion: ((VideoFrame) => GPUTextureView) | null,
+    *   srcTexL: GPUTexture | null, srcTexR: GPUTexture | null, srcTexM: GPUTexture | null,
+    *   canvas: OffscreenCanvas | null,
     *   canvasCtx: GPUCanvasContext | null, targetTex: GPUTexture,
     *   blendU: GPUBuffer, sampler: GPUSampler, blitBind: GPUBindGroup,
     *   gatePool: GpuBufferPool, pixelPool: GpuBufferPool | null,
@@ -615,7 +633,13 @@ export async function convertVideoToAnaglyphGpu(options) {
         w: width / vis.width,
         h: height / vis.height,
       };
-      const yFlip = await probeExternalOrientation(device, importExternal);
+      // Engines without importExternalTexture deliver canvas-staged
+      // textures top-row-first by spec; only the external path needs the
+      // orientation calibration probe.
+      const yFlip =
+        sourceMode === "external"
+          ? await probeExternalOrientation(device, importExternal)
+          : 0;
 
       const plan = await planEncoder(
         width,
@@ -668,7 +692,9 @@ export async function convertVideoToAnaglyphGpu(options) {
       encoder.configure(plan.encoderConfig);
 
       // Blend pipeline: matrices uploaded once; UV crop per run.
-      const blendModule = device.createShaderModule({ code: BLEND_SHADER });
+      const blendModule = device.createShaderModule({
+        code: makeBlendShader(sourceMode === "canvas" ? "texture2d" : "external"),
+      });
       const blendPipe = device.createRenderPipeline({
         layout: "auto",
         vertex: { module: blendModule, entryPoint: "vs_main" },
@@ -763,8 +789,53 @@ export async function convertVideoToAnaglyphGpu(options) {
         tracker: new DirectionTracker(direction === "auto-reverse"),
       });
       const motion = strategy.auto
-        ? new GpuMotion(device, { width, height }, crop, yFlip)
+        ? new GpuMotion(
+            device,
+            { width, height },
+            crop,
+            yFlip,
+            sourceMode === "canvas" ? "texture2d" : "external",
+          )
         : null;
+
+      // Canvas-staged frame sources for `canvas` mode (no
+      // importExternalTexture — Firefox). Each slot has a 2D scratch
+      // canvas sized to the visible rect: drawImage maps the frame's
+      // visible content upright into it, then copyExternalImageToTexture
+      // uploads the even-trimmed top-left region (odd visible dims drop
+      // the last row/column without rescaling, matching the crop
+      // uniform). Separate scratch canvases per slot keep queued copies
+      // independent of later drawImage calls.
+      let srcTexL = null;
+      let srcTexR = null;
+      let srcTexM = null;
+      let stageLeft = null;
+      let stageRight = null;
+      let stageMotion = null;
+      if (sourceMode === "canvas") {
+        const mkStager = () => {
+          const tex = device.createTexture({
+            format: "rgba8unorm",
+            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+            size: [width, height],
+          });
+          const canvas = new OffscreenCanvas(vis.width, vis.height);
+          const ctx = canvas.getContext("2d", { alpha: false, colorSpace: "srgb" });
+          const view = tex.createView();
+          return [tex, (frame) => {
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+            device.queue.copyExternalImageToTexture(
+              { source: canvas },
+              { texture: tex },
+              [width, height],
+            );
+            return view;
+          }];
+        };
+        [srcTexL, stageLeft] = mkStager();
+        [srcTexR, stageRight] = mkStager();
+        [srcTexM, stageMotion] = mkStager();
+      }
 
       return {
         width,
@@ -779,6 +850,13 @@ export async function convertVideoToAnaglyphGpu(options) {
         motion,
         captureMode,
         yFlip,
+        sourceMode,
+        stageLeft,
+        stageRight,
+        stageMotion,
+        srcTexL,
+        srcTexR,
+        srcTexM,
         canvas: capture?.canvas ?? null,
         canvasCtx: capture?.ctx ?? null,
         blendPipe,
@@ -832,9 +910,17 @@ export async function convertVideoToAnaglyphGpu(options) {
           },
         ],
       });
-      // Imported inside the pass: external-texture views cannot leave it.
-      const leftView = importExternal(pass, pair.left.frame);
-      const rightView = importExternal(pass, pair.right.frame);
+      // External mode imports inside the pass (views cannot leave it);
+      // canvas mode stages queue-side — queued copies run before this
+      // submission, so ordering is safe either way.
+      const leftView =
+        core.sourceMode === "external"
+          ? importExternal(pass, pair.left.frame)
+          : core.stageLeft(pair.left.frame);
+      const rightView =
+        core.sourceMode === "external"
+          ? importExternal(pass, pair.right.frame)
+          : core.stageRight(pair.right.frame);
       const blendBind = device.createBindGroup({
         layout: core.blendPipe.getBindGroupLayout(0),
         entries: [
@@ -988,7 +1074,10 @@ export async function convertVideoToAnaglyphGpu(options) {
               // sample: submitted ahead of the chain, so the GPU work
               // overlaps the previous frames' encodes.
               const t = performance.now();
-              core.motion.submit(videoFrame);
+              core.motion.submit(
+                videoFrame,
+                core.stageMotion ? core.stageMotion(videoFrame) : null,
+              );
               pendingSample = await withAbort(core.motion.nextSample());
               stageMs.motion += performance.now() - t;
             }
@@ -1094,7 +1183,16 @@ export async function convertVideoToAnaglyphGpu(options) {
         blender: "WebGPU (direct)",
         frameCopy: "none (WebGPU)",
         capture: core.captureMode === "canvas" ? "canvas \u2192 VideoFrame" : "copyToBuffer \u2192 VideoFrame",
-        orientation: core.yFlip ? "bottom-up (probed)" : "top-left (spec)",
+        textureSource:
+          core.sourceMode === "external"
+            ? "importExternalTexture"
+            : "drawImage + copyExternalImageToTexture",
+        orientation:
+          core.sourceMode === "canvas"
+            ? "top-left (canvas copy)"
+            : core.yFlip
+              ? "bottom-up (probed)"
+              : "top-left (spec)",
         output: `${core.width}\u00d7${core.height}`,
         rotation: core.rotationNote,
         direction: core.strategy.auto
@@ -1136,6 +1234,9 @@ export async function convertVideoToAnaglyphGpu(options) {
       core.blendU.destroy();
       core.gatePool.destroy();
       core.pixelPool?.destroy();
+      for (const tex of [core.srcTexL, core.srcTexR, core.srcTexM]) {
+        tex?.destroy();
+      }
     }
     if (context.ownsDevice !== false) {
       try {

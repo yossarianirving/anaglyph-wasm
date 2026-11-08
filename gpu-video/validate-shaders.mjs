@@ -20,8 +20,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  BLEND_SHADER,
-  LUMA_SHADER,
+  makeBlendShader,
+  makeLumaShader,
   BLIT_SHADER,
   BOX_DOWNSAMPLE,
   makeSadCompute,
@@ -51,8 +51,12 @@ function portable(shader) {
 const dir = mkdtempSync(join(tmpdir(), "wgsl-"));
 let failures = 0;
 const cases = {
-  blend: BLEND_SHADER,
-  luma: LUMA_SHADER,
+  blend: makeBlendShader("external"),
+  luma: makeLumaShader("external"),
+  // Firefox fallback mode: same passes over staged texture_2d sources
+  // (parse verbatim; the portable() rewrite is a no-op for these).
+  blend2d: makeBlendShader("texture2d"),
+  luma2d: makeLumaShader("texture2d"),
   blit: BLIT_SHADER,
   box: BOX_DOWNSAMPLE,
   // The two tile widths motion.js computes: spec-minimum (16 KB) and

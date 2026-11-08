@@ -25,8 +25,7 @@
  * must flip uv.y.
  */
 export function makeImporter(device) {
-  let form = null;
-  const candidates = (pass, frame) => {
+  let form = null;  const candidates = (pass, frame) => {
     const tries = [];
     if (typeof device?.importExternalTexture === "function") {
       tries.push(["deviceSrc", () => device.importExternalTexture({ source: frame })]);
@@ -58,6 +57,22 @@ export function makeImporter(device) {
     }
     throw new Error("no importExternalTexture entry point found");
   };
+}
+
+/**
+ * Whether this engine can import VideoFrames as external textures at all
+ * (any of the entry-point forms above). Firefox ships WebGPU without
+ * `importExternalTexture` — callers fall back to the canvas-staging mode
+ * (`drawImage` + `queue.copyExternalImageToTexture` + `texture_2d`).
+ *
+ * @param {GPUDevice} device
+ * @returns {boolean}
+ */
+export function supportsExternalImport(device) {
+  return (
+    typeof device?.importExternalTexture === "function" ||
+    typeof GPURenderPassEncoder?.prototype?.importExternalTexture === "function"
+  );
 }
 
 /**
