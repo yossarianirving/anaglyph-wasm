@@ -128,7 +128,7 @@
             <pre id="json" class="bg-light p-2 small" style="display: none"></pre>
         </main>
         <script type="module">
-            import init, { MotionAnalyzer, Tracker, VideoBlender } from "./pkg/anaglyph_wasm.js";
+            import init, { MotionAnalyzer, Tracker, VideoBlender, YuvFrameConverter } from "./pkg/anaglyph_wasm.js";
             import { convertVideoToAnaglyph, planEncoder } from "./js/video-pipeline.js";
             import {
                 ALL_FORMATS,
@@ -329,6 +329,42 @@
                 };
             }
 
+            /**
+             * Pure motion-analysis throughput: the wasm block matcher
+             * (`MotionAnalyzer.observe_rgba` + `Tracker.push`) on synthetic
+             * shifted frames with no codecs involved. This is what `auto`
+             * mode adds on top of a fixed pairing, and — because it is the
+             * one stage dominated by raw wasm throughput — the stage where
+             * per-engine JIT differences show up widest.
+             */
+            async function benchMotion({ width, height }, frames) {
+                const analyzer = MotionAnalyzer.new(width, height);
+                const tracker = new Tracker(false);
+                const data = new Uint8Array(width * height * 4);
+                // Textured block noise: the matcher discards low-variance
+                // blocks, so flat synthetic frames would benchmark a no-op.
+                for (let y = 0; y < height; y++) {
+                    for (let x = 0; x < width; x++) {
+                        const o = (y * width + x) * 4;
+                        const v = ((x >> 3) * 37 + (y >> 3) * 91 + ((x ^ y) & 7) * 13) & 0xff;
+                        data[o] = v;
+                        data[o + 1] = (v * 3) & 0xff;
+                        data[o + 2] = (v >> 1) & 0xff;
+                        data[o + 3] = 255;
+                    }
+                }
+                const started = performance.now();
+                for (let i = 0; i < frames; i++) {
+                    // Slide the texture by 4 px per frame (wrap included):
+                    // keeps the matcher's inner loop fully busy.
+                    data.copyWithin(0, 16);
+                    const dx = analyzer.observe_rgba(data);
+                    tracker.push(i, i / 30, dx, analyzer.is_reliable());
+                }
+                const seconds = (performance.now() - started) / 1e3;
+                return { frames, seconds, fps: frames / seconds };
+            }
+
             async function runBenchmark() {
                 const clip = document.getElementById("clip").value;
                 const direction = document.getElementById("direction").value;
@@ -361,6 +397,18 @@
                             encoderLatencyMode,
                             encoderCodec,
                             createBlender: makeCreateBlender(backend),
+                            createYuvConverter: (planeBytes, width, height) => {
+                                const c = new YuvFrameConverter(planeBytes, width, height);
+                                return {
+                                    planesView: () => c.planesView(),
+                                    convert: (g) =>
+                                        c.convert(
+                                            g.yOffset, g.yStride, g.uvOffset, g.uvStride, g.vOffset,
+                                            g.x, g.y, g.width, g.height, g.planar, g.bt709,
+                                        ),
+                                    dstView: () => c.dstView(),
+                                };
+                            },
                             createTracker: direction.startsWith("auto")
                                 ? (w, h, reverse) => makeTracker(w, h, reverse)
                                 : undefined,
@@ -374,6 +422,7 @@
                             output: result.report.output,
                             rotation: result.report.rotation,
                             blender: result.report.blender,
+                            frameCopy: result.report.frameCopy,
                             encoder: result.report.encoder,
                             decoder: result.report.decoder,
                             stageMs: result.stageMs,
@@ -389,6 +438,7 @@
                 let decodeOnly = null;
                 let blendOnly = null;
                 let encodeOnly = null;
+                let motionOnly = null;
                 if (!lastError && perIteration.length > 0) {
                     statusEl.textContent = "decode-only…";
                     decodeOnly = await benchDecode(file);
@@ -416,6 +466,18 @@
                     } catch (err) {
                         encodeOnly = { error: String(err && err.message ? err.message : err) };
                     }
+                    statusEl.textContent = "motion-only…";
+                    try {
+                        motionOnly = await benchMotion(
+                            {
+                                width: dims.sourceWidth & ~1,
+                                height: dims.sourceHeight & ~1,
+                            },
+                            Math.max(120, dims.frames || 180),
+                        );
+                    } catch (err) {
+                        motionOnly = { error: String(err && err.message ? err.message : err) };
+                    }
                 }
 
                 const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
@@ -436,6 +498,7 @@
                     decodeOnly,
                     blendOnly,
                     encodeOnly,
+                    motionOnly,
                     error: lastError,
                     meta: {
                         userAgent: navigator.userAgent,
@@ -460,6 +523,7 @@
                     "fps",
                     "copy ms",
                     "blend ms",
+                    "motion ms",
                     "enc-wait ms",
                     "dec-wait ms",
                     "blend backend",
@@ -476,6 +540,7 @@
                     cell(run.fps.toFixed(1));
                     cell(String(Math.round(run.stageMs.copy)));
                     cell(String(Math.round(run.stageMs.blend)));
+                    cell(String(Math.round(run.stageMs.motion ?? 0)));
                     cell(String(Math.round(run.stageMs.encodeWait)));
                     cell(String(Math.round(run.stageMs.decodeWait)));
                     cell(run.blender);
@@ -487,7 +552,7 @@
                     row.insertCell().textContent = "—";
                     row.insertCell().textContent = String(results.decodeOnly.frames);
                     row.insertCell().textContent = results.decodeOnly.fps.toFixed(1);
-                    row.insertCell().colSpan = 5;
+                    row.insertCell().colSpan = 6;
                     row.insertCell().textContent = "decode-only";
                 }
                 if (results.blendOnly) {
@@ -495,15 +560,23 @@
                     row.insertCell().textContent = "—";
                     row.insertCell().textContent = String(results.blendOnly.frames);
                     row.insertCell().textContent = results.blendOnly.fps.toFixed(1);
-                    row.insertCell().colSpan = 5;
+                    row.insertCell().colSpan = 6;
                     row.insertCell().textContent = `blend-only (${results.blendOnly.gpu ? "GPU" : "CPU"})`;
+                }
+                if (results.motionOnly && !results.motionOnly.error) {
+                    const row = resultsEl.insertRow();
+                    row.insertCell().textContent = "—";
+                    row.insertCell().textContent = String(results.motionOnly.frames);
+                    row.insertCell().textContent = results.motionOnly.fps.toFixed(1);
+                    row.insertCell().colSpan = 6;
+                    row.insertCell().textContent = "motion-only (wasm block match)";
                 }
                 if (results.encodeOnly && !results.encodeOnly.error) {
                     const row = resultsEl.insertRow();
                     row.insertCell().textContent = "—";
                     row.insertCell().textContent = String(results.encodeOnly.frames);
                     row.insertCell().textContent = results.encodeOnly.fps.toFixed(1);
-                    row.insertCell().colSpan = 5;
+                    row.insertCell().colSpan = 6;
                     row.insertCell().textContent = `encode-only (${results.encodeOnly.codec})`;
                 } else if (results.encodeOnly) {
                     const row = resultsEl.insertRow();

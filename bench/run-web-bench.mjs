@@ -1,9 +1,10 @@
 /**
- * Benchmark runner: the browser pipeline (headless Chromium or Firefox via
- * bench-video.html) plus the native CLI, over a fixed clip matrix.
+ * Benchmark runner: the browser pipeline (headless Chromium, Firefox, or
+ * GNOME Web/WebKitGTK, via bench-video.html) plus the native CLI, over a
+ * fixed clip matrix.
  *
  * Usage: node bench/run-web-bench.mjs [--iters N] [--gpu] [--skip-native]
- *                                     [--browser chromium|firefox]
+ *                                     [--browser chromium|firefox|webkit]
  *                                     [--latency quality|realtime] [--hw off]
  *
  * Results land in bench/results/web-<timestamp>.json (and
@@ -49,10 +50,10 @@ const HW = argValue("--hw", "on");
 
 // Firefox (and any browser compared against it) uses the open-codec WebM
 // set; `--webm` forces the same set on every browser for apples-to-apples
-// cross-browser runs.
+// cross-browser runs. WebKitGTK decodes VP9/VP8 through GStreamer.
 const WEBM_CLIPS = ["bench/booth2s-vp9.webm", "bench/boomerang-vp9.webm"];
 const CLIPS =
-  BROWSER === "firefox" || process.argv.includes("--webm")
+  BROWSER === "firefox" || BROWSER === "webkit" || process.argv.includes("--webm")
     ? WEBM_CLIPS
     : ["bench/booth2s.mp4", "bench/booth2s-aac.mp4", "bench/boomerang.mp4"];
 
@@ -73,6 +74,99 @@ function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Open a "page" that can run bench-video.html with autorun and hand back
+ * `window.__benchResults`: Playwright for Chromium/Firefox, WebKitWebDriver
+ * (GNOME Web, the iOS Safari engine family) for webkit. The classic WebDriver
+ * protocol cannot await promises, so the WebKit shim polls instead.
+ */
+async function openPage() {
+  if (BROWSER !== "webkit") {
+    const browser =
+      BROWSER === "firefox"
+        ? await firefox.launch({ headless: true })
+        : await chromium.launch({
+            headless: true,
+            // --gpu: full chromium (headless=new) without SwiftShader pinning, so a
+            // machine with a real GPU actually uses it; the default headless shell
+            // cannot reach WebGPU/hardware codecs at all.
+            ...(WITH_GPU ? { channel: "chromium" } : {}),
+            args: WITH_GPU
+              ? ["--ignore-gpu-blocklist"]
+              : ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
+          });
+    const page = await browser.newPage();
+    page.on("pageerror", (err) => console.error(`[pageerror] ${err.message}`));
+    return {
+      async runBench(url, timeoutMs) {
+        await page.goto(url);
+        await page.waitForFunction(() => window.__benchResults !== null, null, {
+          timeout: timeoutMs,
+        });
+        return page.evaluate(() => window.__benchResults);
+      },
+      close: () => browser.close(),
+    };
+  }
+
+  const DRIVER = "http://127.0.0.1:9922";
+  const req = (method, path, body, timeoutMs = 30000) =>
+    fetch(DRIVER + path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    }).then((r) => r.json());
+
+  let driverProc = null;
+  try {
+    await req("GET", "/status", undefined, 1500);
+  } catch {
+    driverProc = spawn("WebKitWebDriver", ["--host=127.0.0.1", "--port=9922", "--replace-on-new-session"], {
+      stdio: "ignore",
+    });
+    for (let i = 0; i < 80; i++) {
+      try {
+        await req("GET", "/status", undefined, 1000);
+        break;
+      } catch {
+        await sleep(250);
+      }
+    }
+  }
+  const sess = await req("POST", "/session", {
+    capabilities: { alwaysMatch: {}, firstMatch: [{}] },
+  });
+  if (!sess.value?.sessionId) throw new Error(`WebKitWebDriver session failed: ${JSON.stringify(sess)}`);
+  const sid = sess.value.sessionId;
+  return {
+    async runBench(url, timeoutMs) {
+      await req("POST", `/session/${sid}/url`, { url }, 120000);
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const r = await req(
+          "POST",
+          `/session/${sid}/execute/sync`,
+          {
+            script: "return window.__benchResults ? JSON.stringify(window.__benchResults) : null;",
+            args: [],
+          },
+          20000,
+        );
+        if (typeof r.value === "string") return JSON.parse(r.value);
+        await sleep(400);
+      }
+      throw new Error("bench page never produced results");
+    },
+    async close() {
+      await req("DELETE", `/session/${sid}`, undefined, 5000).catch(() => {});
+      driverProc?.kill();
+    },
+  };
 }
 
 async function waitForServer(retries = 30) {
@@ -105,25 +199,10 @@ const server = spawn("python3", ["-m", "http.server", String(PORT), "--bind", "1
   stdio: "ignore",
 });
 
-let browser;
+let page;
 try {
   await waitForServer();
-  if (BROWSER === "firefox") {
-    browser = await firefox.launch({ headless: true });
-  } else {
-    browser = await chromium.launch({
-      headless: true,
-      // --gpu: full chromium (headless=new) without SwiftShader pinning, so a
-      // machine with a real GPU actually uses it; the default headless shell
-      // cannot reach WebGPU/hardware codecs at all.
-      ...(WITH_GPU ? { channel: "chromium" } : {}),
-      args: WITH_GPU
-        ? ["--ignore-gpu-blocklist"]
-        : ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
-    });
-  }
-  const page = await browser.newPage();
-  page.on("pageerror", (err) => console.error(`[pageerror] ${err.message}`));
+  page = await openPage();
 
   const web = [];
   for (const run of webRuns) {
@@ -136,11 +215,12 @@ try {
       ...(HW === "off" ? { hwDecode: "0", hwEncode: "0" } : {}),
     });
     process.stdout.write(`web ${run.clip} ${run.direction}/${run.backend} … `);
-    await page.goto(`${BASE}/bench-video.html?${query}`);
-    await page.waitForFunction(() => window.__benchResults !== null, null, {
-      timeout: 600_000,
-    });
-    const result = await page.evaluate(() => window.__benchResults);
+    let result;
+    try {
+      result = await page.runBench(`${BASE}/bench-video.html?${query}`, 600_000);
+    } catch (err) {
+      result = { clip: run.clip, direction: run.direction, backend: run.backend, error: String(err) };
+    }
     if (result.error) {
       console.log(`ERROR: ${result.error}`);
     } else {
@@ -186,10 +266,19 @@ try {
       encoder: run.iters[0]?.encoder ?? null,
       decoder: run.iters[0]?.decoder ?? null,
       medianFps: run.iters.length ? median(run.iters.map((r) => r.fps)) : null,
+      medianStageMs: run.iters.length
+        ? Object.fromEntries(
+            ["copy", "blend", "motion", "encodeWait", "decodeWait"].map((k) => [
+              k,
+              median(run.iters.map((r) => r.stageMs?.[k] ?? 0)),
+            ]),
+          )
+        : null,
       iterations: run.iters,
       decodeOnly: run.decodeOnly,
       blendOnly: run.blendOnly,
       encodeOnly: run.encodeOnly,
+      motionOnly: run.motionOnly,
       error: run.error,
     })),
     native,
@@ -201,7 +290,7 @@ try {
   writeFileSync(join(resultsDir, "latest.md"), markdown);
   console.log(`wrote ${join(resultsDir, "latest.md")}\n\n${markdown}`);
 } finally {
-  await browser?.close();
+  await page?.close();
   server.kill();
 }
 
@@ -219,18 +308,23 @@ function renderMarkdown(payload) {
   lines.push(`Browser: ${payload.webMeta?.userAgent ?? "unknown"}`);
   lines.push(`WebGPU: ${payload.webMeta?.webgpu ?? "unknown"}`);
   lines.push("");
-  lines.push("| clip | direction | backend | blend backend | median pairs/s | decode-only fps | encode-only fps | blend-only fps |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| clip | direction | backend | blend backend | median pairs/s | copy ms | blend ms | motion ms | enc-wait ms | dec-wait ms | decode-only fps | encode-only fps | blend-only fps | motion-only fps |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const run of payload.web) {
     if (run.error) {
-      lines.push(`| ${run.clip} | ${run.direction} | ${run.backend} | — | ERROR: ${run.error} | — | — | — |`);
+      lines.push(`| ${run.clip} | ${run.direction} | ${run.backend} | — | ERROR: ${run.error} | — | — | — | — | — | — | — | — | — |`);
       continue;
     }
+    const s = run.medianStageMs ?? {};
     lines.push(
       `| ${run.clip} | ${run.direction} | ${run.backend} | ${run.blender ?? "?"} | ` +
-        `${run.medianFps.toFixed(1)} | ${run.decodeOnly ? run.decodeOnly.fps.toFixed(1) : "—"} | ` +
+        `${run.medianFps.toFixed(1)} | ` +
+        `${Math.round(s.copy ?? 0)} | ${Math.round(s.blend ?? 0)} | ${Math.round(s.motion ?? 0)} | ` +
+        `${Math.round(s.encodeWait ?? 0)} | ${Math.round(s.decodeWait ?? 0)} | ` +
+        `${run.decodeOnly ? run.decodeOnly.fps.toFixed(1) : "—"} | ` +
         `${run.encodeOnly && !run.encodeOnly.error ? run.encodeOnly.fps.toFixed(1) : "—"} | ` +
-        `${run.blendOnly ? run.blendOnly.fps.toFixed(1) : "—"} |`,
+        `${run.blendOnly ? run.blendOnly.fps.toFixed(1) : "—"} | ` +
+        `${run.motionOnly && !run.motionOnly.error ? run.motionOnly.fps.toFixed(1) : "—"} |`,
     );
   }
   if (payload.native) {

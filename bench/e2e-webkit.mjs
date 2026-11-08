@@ -16,17 +16,20 @@
  * normally on XWayland).
  *
  * Checks:
- *  - conversion succeeds, report says `frameCopy: "canvas raster"`
+ *  - conversion succeeds on the raw-plane fast path: `frameCopy` reports
+ *    the wasm NV12/I420 conversion, not the canvas fallback
  *  - output decodes with ffprobe, right frame count (N-1 pairs)
  *  - output frame is NOT gray garbage: luma spread (YDIF/YMIN..YMAX) and
  *    red/cyan channel structure present (the NV12-as-RGBA failure mode is
  *    mostly-flat gray and would fail both)
+ *  - output frame matches the Chromium reference within PSNR ≥ 30 dB
+ *    (the wasm YUV→RGBA conversion vs the browser's own raster)
  *  - rotation metadata survives (rotated.mp4)
  *  - cancel recovers the page: worker ends the conversion and a second
  *    conversion then completes in the same page (the user-reported hang).
  */
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -126,6 +129,15 @@ async function convertInPage(sid, file, opts = {}) {
       anaglyphType: "color",
       direction: ${JSON.stringify(opts.direction ?? "clockwise")},
       createBlender: (w, h, t, backend) => wasm.VideoBlender.new(w, h, t, backend ?? null),
+      createYuvConverter: (planeBytes, width, height) => {
+        const c = new wasm.YuvFrameConverter(planeBytes, width, height);
+        return {
+          planesView: () => c.planesView(),
+          convert: (g) => c.convert(g.yOffset, g.yStride, g.uvOffset, g.uvStride, g.vOffset,
+            g.x, g.y, g.width, g.height, g.planar, g.bt709),
+          dstView: () => c.dstView(),
+        };
+      },
     });
     const bytes = new Uint8Array(await out.arrayBuffer());
     let bin = "";
@@ -202,13 +214,19 @@ async function main() {
       name: "basic anaglyph",
       file: "booth2s.mp4",
       check: (report) => {
-        if (report.frameCopy !== "canvas raster") {
-          throw new Error(`expected canvas raster copy on WebKit, got "${report.frameCopy}"`);
+        // The whole point of the raw-plane path: WebKit must feed the wasm
+        // YUV converter, not rasterize every frame through a canvas.
+        if (!/^(NV12|I420) → RGBA \(wasm\)$/.test(report.frameCopy)) {
+          throw new Error(`expected raw-plane wasm copy on WebKit, got "${report.frameCopy}"`);
         }
         if (report.frames < 180) throw new Error(`too few frames: ${report.frames}`);
       },
       probeMinFrames: 180,
       notGray: true,
+      // Same source/direction converted by Chromium earlier (bench/
+      // e2e-out-silent-sample.mp4): both paths must land on the same
+      // colors within encoder noise.
+      psnrAgainst: "e2e-out-silent-sample.mp4",
     },
     {
       name: "audio copy",
@@ -266,6 +284,16 @@ async function main() {
         if (stats.ydif < 8) {
           throw new Error(`frame looks gray (YDIF=${stats.ydif.toFixed(1)}) — NV12-as-RGBA regression?`);
         }
+      }
+      if (c.psnrAgainst && existsSync(join(root, "bench", c.psnrAgainst))) {
+        // Wasm YUV→RGBA vs Chromium's own conversion, same frame: encoder
+        // noise aside, the colors must agree (the garbling bug failed this
+        // by miles, the canvas path passes it trivially).
+        const psnr = psnrAgainstReference(out, join(root, "bench", c.psnrAgainst), 60, tmp, c.name);
+        if (!(psnr >= 30)) {
+          throw new Error(`frame 60 PSNR vs Chromium reference: ${psnr.toFixed(1)} dB < 30`);
+        }
+        ok(`${c.name} psnr`, `${psnr.toFixed(1)} dB vs ${c.psnrAgainst}`);
       }
       ok(c.name, out);
     } catch (e) {
@@ -361,6 +389,30 @@ function frameSignalStats(png) {
     return m ? parseFloat(m[1]) : NaN;
   };
   return { yavg: num("YAVG"), ymin: num("YMIN"), ymax: num("YMAX"), ydif: num("YDIF") };
+}
+
+/** Average PSNR (dB) of frame `n` of `file` against frame `n` of `ref`. */
+function psnrAgainstReference(file, ref, n, tmp, tag) {
+  const pngs = [];
+  for (const [src, name] of [
+    [file, `a`],
+    [ref, `b`],
+  ]) {
+    const png = join(tmp, `psnr-${tag}-${name}.png`);
+    execFileSync("ffmpeg", [
+      "-v", "error", "-y", "-i", src,
+      "-vf", `select=eq(n\\,${n})`, "-frames:v", "1", png,
+    ]);
+    pngs.push(png);
+  }
+  const r = spawnSync(
+    "ffmpeg",
+    ["-v", "info", "-i", pngs[0], "-i", pngs[1], "-lavfi", "psnr", "-f", "null", "-"],
+    { encoding: "utf8" },
+  );
+  const m = /average:([0-9]+(?:\.[0-9]+)?|inf)/.exec(r.stderr ?? "");
+  if (!m) throw new Error(`unparsable psnr output: ${(r.stderr ?? "").slice(-300)}`);
+  return m[1] === "inf" ? Infinity : parseFloat(m[1]);
 }
 
 main().finally(() => {
