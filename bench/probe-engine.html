@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>engine capability probe</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script>
+      addEventListener("unhandledrejection", (e) =>
+        (document.getElementById("out").textContent = "REJECT: " + (e.reason?.stack ?? e.reason)));
+      addEventListener("error", (e) => (document.getElementById("out").textContent = "ERROR: " + e.message));
+    </script>
+    <script type="module">
+      import {
+        ALL_FORMATS, BlobSource, EncodedPacketSink, Input,
+      } from "../vendor/mediabunny.mjs";
+
+      const outEl = document.getElementById("out");
+      const log = {};
+      const finish = () => (outEl.textContent = JSON.stringify(log, null, 2));
+
+      log.ua = navigator.userAgent;
+      log.hasGpu = "gpu" in navigator;
+      const ad = await navigator.gpu.requestAdapter();
+      log.adapter = ad ? { features: [...ad.features].sort(), limits: {
+        maxTextureDimension2D: ad.limits.maxTextureDimension2D } } : null;
+      const device = await ad.requestDevice();
+
+      log.api = {
+        deviceImport: typeof device.importExternalTexture,
+        passImport: typeof GPURenderPassEncoder?.prototype?.importExternalTexture,
+        copyExternal: typeof device.queue?.copyExternalImageToTexture,
+        videoFrame: typeof VideoFrame,
+        offscreen: typeof OffscreenCanvas,
+      };
+
+      const input = new Input({ source: new BlobSource(await (await fetch("../bench/booth2s.mp4")).blob()), formats: ALL_FORMATS });
+      const track = await input.getPrimaryVideoTrack();
+      const cfg = await track.getDecoderConfig();
+      const frames = [];
+      await new Promise((resolve, reject) => {
+        const dec = new VideoDecoder({
+          output(f) { frames.push(f); if (frames.length >= 61) resolve(); },
+          error: reject,
+        });
+        dec.configure(cfg);
+        (async () => {
+          for await (const p of new EncodedPacketSink(track).packets()) {
+            dec.decode(p.toEncodedVideoChunk());
+            if (frames.length >= 61) break;
+          }
+          await dec.flush().catch(() => {});
+          resolve();
+        })().catch(reject);
+      });
+      const single = frames[60];
+      log.frameMeta = { coded: [single.codedWidth, single.codedHeight], visible: single.visibleRect ? [single.visibleRect.x, single.visibleRect.y, single.visibleRect.width, single.visibleRect.height] : null, display: single.displayWidth ? [single.displayWidth, single.displayHeight] : null };
+
+      // 1. Shader compile probe: texture_external plain.
+      async function tryCompile(label, code) {
+        const module = device.createShaderModule({ code });
+        const ci = await module.getCompilationInfo();
+        log[label] = ci.messages.length ? ci.messages.map((m) => m.message.split("\n")[0]).join(" | ").slice(0, 200) : "ok";
+      }
+      await tryCompile("extPlain", `
+        @group(0) @binding(0) var t: texture_external;
+        @group(0) @binding(1) var s: sampler;
+        @fragment fn f(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+          return textureSampleBaseClampToEdge(t, s, p.xy / vec2(480.0, 270.0));
+        }`);
+      await tryCompile("extExtensionDecl", `
+        @extension("texture_external")
+        @group(0) @binding(0) var t: texture_external;
+        @group(0) @binding(1) var s: sampler;
+        @fragment fn f(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+          return textureSampleBaseClampToEdge(t, s, p.xy / vec2(480.0, 270.0));
+        }`);
+
+      // 2. copyExternalImageToTexture: VideoFrame -> rgba8unorm texture.
+      async function tryCopyExternal(label, source) {
+        try {
+          const tex = device.createTexture({
+            size: [480, 270], format: "rgba8unorm",
+            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          device.queue.copyExternalImageToTexture(
+            { source },
+            { texture: tex },
+            [480, 270],
+          );
+          // read back a couple of rows via render pass to canvas-free readback.
+          const module = device.createShaderModule({ code: `
+            @group(0) @binding(0) var t: texture_2d<f32>;
+            @group(0) @binding(1) var s: sampler;
+            @fragment fn f(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+              return textureSample(t, s, p.xy / vec2(480.0, 270.0));
+            }` });
+          const pipe = device.createRenderPipeline({
+            layout: "auto",
+            fragment: { module, entryPoint: "f", targets: [{ format: "bgra8unorm" }] },
+          });
+          const out = device.createTexture({
+            size: [480, 270], format: "bgra8unorm",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+          });
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginRenderPass({ colorAttachments: [{
+            view: out.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store",
+          }]});
+          pass.setPipeline(pipe);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: pipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: tex.createView() },
+              { binding: 1, resource: device.createSampler() },
+            ],
+          }));
+          pass.draw(1);
+          pass.end();
+          const bpr = (4 * 4 + 255) & ~255;
+          const rb = device.createBuffer({ size: bpr * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+          enc.copyTextureToBuffer({ texture: out }, { buffer: rb, bytesPerRow: bpr }, { width: 4, height: 4 });
+          device.queue.submit([enc.finish()]);
+          await rb.mapAsync(GPUMapMode.READ);
+          const bytes = new Uint8Array(rb.getMappedRange().slice(0));
+          rb.unmap(); rb.destroy(); tex.destroy();
+          log[label] = "ok px(0,0)=" + [bytes[2], bytes[1], bytes[0]];
+        } catch (e) {
+          log[label] = "FAIL: " + e.message;
+        }
+      }
+      await tryCopyExternal("copyVideoFrame", single);
+      try {
+        const c = new OffscreenCanvas(480, 270);
+        const cx = c.getContext("2d", { alpha: false });
+        cx.drawImage(single, 0, 0);
+        await tryCopyExternal("copyCanvas2d", c);
+      } catch (e) {
+        log.copyCanvas2d = "setup FAIL: " + e.message;
+      }
+
+      // 3. VideoFrame from 2D canvas.
+      try {
+        const c = new OffscreenCanvas(8, 8);
+        const cx = c.getContext("2d", { alpha: false });
+        cx.fillStyle = "#fff"; cx.fillRect(0, 0, 8, 4);
+        cx.fillStyle = "#000"; cx.fillRect(0, 4, 8, 4);
+        const vf = new VideoFrame(c, { timestamp: 0 });
+        log.videoFrameFromCanvas = { coded: [vf.codedWidth, vf.codedHeight], format: vf.format };
+        vf.close();
+      } catch (e) {
+        log.videoFrameFromCanvas = "FAIL: " + e.message;
+      }
+
+      for (const fr of frames) fr.close();
+      input.dispose();
+      finish();
+    </script>
+  </body>
+</html>

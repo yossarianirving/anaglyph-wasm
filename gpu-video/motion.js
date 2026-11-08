@@ -26,6 +26,7 @@
  */
 
 import { LUMA_SHADER, BOX_DOWNSAMPLE, makeSadCompute } from "./shaders.js";
+import { makeImporter } from "./external.js";
 
 /** Mirror of the motion.rs constants. */
 export const TARGET_WIDTH = 256;
@@ -124,12 +125,15 @@ export class GpuMotion {
   /**
    * @param {GPUDevice} device
    * @param {{width: number, height: number}} visible frame size the
-   *   analysis runs on (luma texture size; VideoFrames may be larger —
-   *   the luma pass crops to `crop`).
+   *   analysis runs on (luma texture size; the external texture is the
+   *   frame's visible rect, so this matches its dimensions up to the
+   *   odd-dimension trim expressed by `crop`).
    * @param {{x0: number, y0: number, w: number, h: number}} crop
-   *   visible-rect crop in coded-UV units (same uniform as the blend pass).
+   *   source window in image uv units (same uniform as the blend pass).
+   * @param {0 | 1} [flip] external-texture y flip from the orientation
+   *   calibration (see `probeExternalOrientation`).
    */
-  constructor(device, { width, height }, crop) {
+  constructor(device, { width, height }, crop, flip = 0) {
     this.device = device;
     this.crop = crop;
     this.geo = analysisGeometry(width, height);
@@ -146,17 +150,22 @@ export class GpuMotion {
     const f32Bytes = gridW * gridH * 4 * 4;
     this._blockBytes = f32Bytes;
 
-    /** Full-size luma (fragment target) + double-buffered analysis. */
+    /** Full-size luma (fragment target) + double-buffered analysis.
+     * Rendering into r32float needs the float32-renderable feature; fall
+     * back to r16float (both sample fine via textureLoad in the compute
+     * passes, and luma*255 is exactly representable in either). */
+    this.lumaFormat = device.features.has("float32-renderable")
+      ? "r32float"
+      : "r16float";
     const lumaFlags =
       GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
     const smallFlags =
       GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
-    const f32Tex = { format: "r32float", usage: lumaFlags, dimension: "2d" };
     /** @type {GPUTexture} */
     this.fullTex = device.createTexture({
-      ...f32Tex,
-      width,
-      height,
+      format: this.lumaFormat,
+      usage: lumaFlags,
+      size: [width, height],
       sampleCount: 1,
     });
     /** @type {GPUTexture[]} */
@@ -164,14 +173,18 @@ export class GpuMotion {
       device.createTexture({
         format: "r32float",
         usage: smallFlags,
-        width: Math.max(1, w),
-        height: Math.max(1, h),
+        size: [Math.max(1, w), Math.max(1, h)],
         sampleCount: 1,
       }),
     );
 
-    // Uniforms (written once; crop is fixed at plan time).
-    this.lumaU = this._uniform(new Float32Array([crop.x0, crop.y0, crop.w, crop.h]));
+    // Uniforms (written once; crop and flip are fixed at plan time).
+    this.lumaU = this._uniform(
+      new Float32Array([crop.x0, crop.y0, crop.w, crop.h, flip, 0, 0, 0]),
+    );
+    // Clamp-to-edge sampler for the external (video) samples; required by
+    // the current WGSL textureSampleBaseClampToEdge overload.
+    this.sampler = device.createSampler();
     this.boxU = this._uniform(
       new Uint32Array([width, height, Math.max(1, w), Math.max(1, h)]),
     );
@@ -217,7 +230,7 @@ export class GpuMotion {
       fragment: {
         module: lumaMod,
         entryPoint: "fs_main",
-        targets: [{ format: "r32float" }],
+        targets: [{ format: this.lumaFormat }],
       },
       primitive: { topology: "triangle-list" },
     });
@@ -276,7 +289,7 @@ export class GpuMotion {
     this._havePrev = false;
     this._curIdx = 0;
     this._closed = false;
-    this._importIsDict = undefined;
+    this._importer = makeImporter(device);
   }
 
   _uniform(data) {
@@ -299,22 +312,10 @@ export class GpuMotion {
     return buf;
   }
 
-  /** Import a VideoFrame, coping with the dict-vs-positional API skew. */
-  _import(device, encoder, frame) {
-    const tryDict = () =>
-      encoder.importExternalTexture({ externalTexture: frame });
-    const tryPos = () => encoder.importExternalTexture(frame);
-    if (this._importIsDict === true) return tryDict();
-    if (this._importIsDict === false) return tryPos();
-    try {
-      const view = tryDict();
-      this._importIsDict = true;
-      return view;
-    } catch {
-      const view = tryPos();
-      this._importIsDict = false;
-      return view;
-    }
+  /** Import a VideoFrame as an external texture (entry-point probing in
+   * external.js; import inside the render pass that samples it). */
+  _import(pass, frame) {
+    return this._importer(pass, frame);
   }
 
   /**
@@ -328,9 +329,9 @@ export class GpuMotion {
     if (this._closed) return;
     const device = this.device;
     const encoder = device.createCommandEncoder({ label: "motion" });
-    const view = this._import(device, encoder, frame);
 
-    // 1. Luma -> full-size r32float.
+    // 1. Luma -> full-size r32float. The frame is imported inside the
+    // render pass: external-texture views cannot leave it.
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -341,12 +342,14 @@ export class GpuMotion {
         },
       ],
     });
+    const view = this._import(pass, frame);
     pass.setPipeline(this.lumaPipe);
     pass.setBindGroup(0, device.createBindGroup({
       layout: this.lumaPipe.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: view },
         { binding: 1, resource: { buffer: this.lumaU } },
+        { binding: 2, resource: this.sampler },
       ],
     }));
     pass.draw(3);

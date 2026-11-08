@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>canvas-import + uv-top verification</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script>
+      addEventListener("unhandledrejection", (e) =>
+        (document.getElementById("out").textContent = "REJECT: " + (e.reason?.stack ?? e.reason)));
+      addEventListener("error", (e) => (document.getElementById("out").textContent = "ERROR: " + e.message));
+    </script>
+    <script type="module">
+      import {
+        ALL_FORMATS, BlobSource, EncodedPacketSink, Input,
+      } from "../vendor/mediabunny.mjs";
+      import { makeImporter } from "../gpu-video/external.js";
+
+      const outEl = document.getElementById("out");
+      const log = {};
+      const finish = () => (outEl.textContent = JSON.stringify(log, null, 2));
+
+      const ad = await navigator.gpu.requestAdapter();
+      const device = await ad.requestDevice();
+      const importExternal = makeImporter(device);
+      const W = 480, H = 270;
+
+      const input = new Input({ source: new BlobSource(await (await fetch("../bench/booth2s.mp4")).blob()), formats: ALL_FORMATS });
+      const track = await input.getPrimaryVideoTrack();
+      const cfg = await track.getDecoderConfig();
+      const frames = [];
+      await new Promise((resolve, reject) => {
+        const dec = new VideoDecoder({
+          output(f) { frames.push(f); if (frames.length >= 61) resolve(); },
+          error: reject,
+        });
+        dec.configure(cfg);
+        (async () => {
+          for await (const p of new EncodedPacketSink(track).packets()) {
+            dec.decode(p.toEncodedVideoChunk());
+            if (frames.length >= 61) break;
+          }
+          await dec.flush().catch(() => {});
+          resolve();
+        })().catch(reject);
+      });
+      const single = frames[60];
+
+      // uv.y = 0 at the TOP of the render target (texture convention).
+      const module = device.createShaderModule({ code: `
+        @group(0) @binding(0) var srcTex: texture_external;
+        @group(0) @binding(1) var samp: sampler;
+        struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+        @vertex fn vs_top(@builtin(vertex_index) vi: u32) -> VOut {
+          var p = array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+          var o: VOut; o.pos = vec4<f32>(p[vi],0.,1.);
+          o.uv = vec2<f32>((p[vi].x + 1.0) * 0.5, (1.0 - p[vi].y) * 0.5);
+          return o;
+        }
+        @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+          return textureSampleBaseClampToEdge(srcTex, samp, in.uv);
+        }` });
+
+      async function renderTop(source) {
+        const pipe = device.createRenderPipeline({
+          layout: "auto",
+          vertex: { module, entryPoint: "vs_top" },
+          fragment: { module, entryPoint: "fs_main", targets: [{ format: "bgra8unorm" }] },
+          primitive: { topology: "triangle-list" },
+        });
+        const tex = device.createTexture({
+          format: "bgra8unorm",
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+          size: [W, H],
+        });
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginRenderPass({ colorAttachments: [{
+          view: tex.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store",
+        }]});
+        const view = importExternal(pass, source);
+        pass.setPipeline(pipe);
+        pass.setBindGroup(0, device.createBindGroup({
+          layout: pipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: view },
+            { binding: 1, resource: device.createSampler() },
+          ],
+        }));
+        pass.draw(3);
+        pass.end();
+        const bpr = (W * 4 + 255) & ~255;
+        const rb = device.createBuffer({ size: bpr * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        enc.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: bpr }, { width: W, height: H });
+        device.queue.submit([enc.finish()]);
+        await rb.mapAsync(GPUMapMode.READ);
+        const buf = new Uint8Array(rb.getMappedRange().slice(0));
+        rb.unmap(); rb.destroy(); tex.destroy();
+        return { buf, bpr };
+      }
+
+      function contentRows({ buf, bpr }) {
+        const lm = (y) => {
+          let s = 0;
+          for (let x = 0; x < W; x += 4) {
+            s += 0.299 * buf[y * bpr + x * 4 + 2] + 0.587 * buf[y * bpr + x * 4 + 1] + 0.114 * buf[y * bpr + x * 4];
+          }
+          return s / Math.ceil(W / 4);
+        };
+        let first = -1, last = -1;
+        for (let y = 0; y < H; y++) if (lm(y) < 250) { if (first < 0) first = y; last = y; }
+        return [first, last];
+      }
+
+      // A) drawImage-normalized 2D canvas -> import -> uv-top render.
+      const scratch = new OffscreenCanvas(W, H);
+      const sctx = scratch.getContext("2d", { alpha: false, colorSpace: "srgb" });
+      sctx.drawImage(single, 0, 0, W, H);
+      let canvasOk = true;
+      try {
+        log.canvasImportContentRows = contentRows(await renderTop(scratch));
+      } catch (e) {
+        canvasOk = false;
+        log.canvasImportContentRows = "FAIL: " + e.message;
+      }
+
+      // B) raw video frame import -> uv-top render (orientation + visible-only check).
+      log.videoImportContentRows = contentRows(await renderTop(single));
+
+      // C) color spot-check: canvas import vs drawImage getImageData.
+      if (canvasOk) {
+        const ref = sctx.getImageData(0, 0, W, H).data;
+        const c = await renderTop(scratch);
+        const spots = [];
+        for (const [x, y] of [[165, 200], [240, 120], [100, 50], [400, 150]]) {
+          const ri = (y * W + x) * 4;
+          const ci = (y * c.bpr + x) * 4;
+          spots.push(`(${x},${y}) ref[${ref[ri]},${ref[ri + 1]},${ref[ri + 2]}] gpu[${c.buf[ci + 2]},${c.buf[ci + 1]},${c.buf[ci]}]`);
+        }
+        log.colorSpots = spots;
+      }
+
+      for (const fr of frames) fr.close();
+      input.dispose();
+      finish();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,409 @@
+/**
+ * End-to-end tests for the all-GPU pipeline (gpu-video/).
+ *
+ * Serves the repo, drives gpu-video/video.html in a real Chrome on the
+ * sample clips in bench/, and validates each result with ffprobe (codec,
+ * dimensions, frame count, audio streams, rotation metadata) — mirroring
+ * bench/e2e-video.mjs for the wasm pipeline.
+ *
+ * Usage: node bench/e2e-gpu.mjs [name-filter] [--headless] [--bytes]
+ *        [--browser=chrome|firefox|webkit]
+ *
+ * WebGPU needs `--ignore-gpu-blocklist` on this machine (the driver
+ * blocklist rejects the Mesa stack). Headed is the default because
+ * headless-shell builds have no WebGPU; pass --headless to try
+ * headless=new anyway. --bytes runs the default cases through the
+ * copyTextureToBuffer encode path instead of canvas capture.
+ */
+import { execFileSync, spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium, firefox, webkit } from "playwright";
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const PORT = 8125;
+const BASE = `http://localhost:${PORT}`;
+const sample = (name) => join(root, "bench", name);
+
+/** ffprobe a file, returning a compact multi-line summary. */
+function probe(file) {
+  const streams = execFileSync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-count_frames",
+      "-show_entries",
+      "stream=index,codec_type,codec_name,width,height,nb_read_frames",
+      "-of",
+      "compact",
+      file,
+    ],
+  ).toString();
+  const side = execFileSync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-read_intervals",
+      "%+#1",
+      "-show_entries",
+      "frame_side_data_list",
+      "-of",
+      "compact",
+      file,
+    ],
+  ).toString();
+  return streams + side;
+}
+
+const CASES = [
+  {
+    name: "silent sample",
+    file: sample("booth2s.mp4"),
+    expectAudio: false,
+    check(report, output) {
+      requireStream(output, "codec_type=video", "codec_name=h264");
+      requireNoStream(output, "codec_type=audio");
+    },
+  },
+  {
+    name: "aac sample",
+    file: sample("booth2s-aac.mp4"),
+    expectAudio: true,
+    check(report, output) {
+      requireStream(output, "codec_type=audio", "codec_name=aac");
+    },
+  },
+  {
+    // Reference from bench/e2e-video.mjs: exactly one reversal, ~5.67s.
+    name: "boomerang auto",
+    file: sample("boomerang.mp4"),
+    direction: "auto",
+    expectAudio: false,
+    check(report) {
+      if (report.direction !== "auto") {
+        throw new Error(`expected auto direction, got "${report.direction}"`);
+      }
+      const reversals =
+        report.reversals === "none detected" ? [] : report.reversals.split("; ");
+      if (reversals.length !== 1) {
+        throw new Error(
+          `expected exactly 1 reversal (native CLI reference), got ${reversals.length}: "${report.reversals}"`,
+        );
+      }
+      if (!/counter-clockwise -> clockwise/.test(reversals[0])) {
+        throw new Error(`reversal direction mismatch, got "${reversals[0]}"`);
+      }
+      const seconds = Number(/([0-9.]+)s/.exec(reversals[0])?.[1]);
+      if (!(Math.abs(seconds - 5.67) <= 0.15)) {
+        throw new Error(`reversal time ${seconds}s deviates from 5.67s`);
+      }
+    },
+  },
+  {
+    name: "boomerang auto-reverse",
+    file: sample("boomerang.mp4"),
+    direction: "auto-reverse",
+    expectAudio: false,
+    check(report) {
+      if (report.direction !== "auto (reversed)") {
+        throw new Error(`expected "auto (reversed)" label, got "${report.direction}"`);
+      }
+      if (!/clockwise -> counter-clockwise/.test(report.reversals)) {
+        throw new Error(`expected mirrored reversal, got "${report.reversals}"`);
+      }
+    },
+  },
+  {
+    // VP9 in WebM with odd coded dimensions (481x271): crop to even.
+    name: "odd dims",
+    file: sample("odd-dims.webm"),
+    expectAudio: false,
+    check(report, output) {
+      if (report.width !== "481" || report.height !== "271") {
+        throw new Error(`expected source dims 481x271, got ${report.width}x${report.height}`);
+      }
+      requireStream(output, "codec_type=video", "width=480", "height=270");
+    },
+  },
+  {
+    name: "rotation",
+    file: sample("rotated.mp4"),
+    expectAudio: false,
+    check(report, output) {
+      if (!/rotation=90/.test(output)) {
+        throw new Error("output lost the 90-degree display matrix");
+      }
+    },
+  },
+  {
+    name: "software decode",
+    file: sample("booth2s.mp4"),
+    unchecks: ["hwDecode"],
+    expectAudio: false,
+    check(report) {
+      if (!/\(software-forced\)/.test(report.decoder)) {
+        throw new Error(`expected software-forced decoder, got "${report.decoder}"`);
+      }
+    },
+  },
+  {
+    name: "opus in mp4",
+    file: sample("opus-in-mp4.mp4"),
+    check(report, output) {
+      if (!/cannot be stream-copied/i.test(report.audio)) {
+        throw new Error(`expected a stream-copy refusal note, got "${report.audio}"`);
+      }
+      requireNoStream(output, "codec_type=audio");
+    },
+  },
+  {
+    name: "one frame",
+    file: sample("one-frame.mp4"),
+    expectError: /fewer than two frames/,
+  },
+  {
+    name: "corrupt upload",
+    file: sample("corrupt.mp4"),
+    expectError: /Failed: .+/,
+  },
+  {
+    // Cancel mid-run then convert again in the SAME page (worker must not
+    // stay busy — the iOS/WebKit regression the wasm suite guards).
+    name: "cancel",
+    file: sample("long-boomerang.mp4"),
+    cancelAfterMs: 400,
+    thenRecover: sample("booth2s.mp4"),
+  },
+];
+
+function requireStream(probeOutput, ...needles) {
+  const has = probeOutput
+    .split("\n")
+    .some((l) => /codec_type=/.test(l) && needles.every((n) => l.includes(n)));
+  if (!has) {
+    throw new Error(`ffprobe lacks a stream with all of: ${needles.join(", ")}`);
+  }
+}
+
+function requireNoStream(probeOutput, needle) {
+  const bad = probeOutput
+    .split("\n")
+    .some((l) => /codec_type=/.test(l) && l.includes(needle));
+  if (bad) throw new Error(`ffprobe unexpectedly matched ${needle}`);
+}
+
+function fail(message) {
+  console.error(`FAIL: ${message}`);
+  process.exitCode = 1;
+  throw new Error(message);
+}
+
+async function waitForServer(retries = 30) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await fetch(BASE + "/gpu-video/video.html");
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  fail("static server did not come up");
+}
+
+const server = spawn("python3", ["-m", "http.server", String(PORT), "--bind", "127.0.0.1"], {
+  cwd: root,
+  stdio: "ignore",
+});
+
+const useBytes = process.argv.includes("--bytes");
+const browserName =
+  process.argv.find((a) => a.startsWith("--browser="))?.slice("--browser=".length) ?? "chrome";
+const headless = process.argv.includes("--headless");
+const launchers = {
+  // Chrome needs `--ignore-gpu-blocklist` on this machine (the driver
+  // blocklist rejects the Mesa/radv stack); headed is the default because
+  // headless-shell builds have no WebGPU.
+  chrome: () =>
+    chromium.launch({
+      channel: "chrome",
+      headless,
+      args: ["--ignore-gpu-blocklist"],
+    }),
+  // Firefox WebGPU is behind these prefs (released in 141+; the prefs
+  // keep pre-release builds working too).
+  firefox: () =>
+    firefox.launch({
+      headless,
+      firefoxUserPrefs: {
+        "dom.webgpu.enabled": true,
+        "gfx.webrender.all": true,
+      },
+    }),
+  // Playwright WebKit: the Ubuntu fallback build needs the ICU-74/libxml2
+  // shims in ~/.cache/ms-playwright/webkit-2388/minibrowser-*/lib and
+  // PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 on Arch hosts; WebGPU is
+  // an unstable feature enabled via MiniBrowser's -F flag.
+  webkit: () => webkit.launch({ headless: false, args: ["--features=WebGPU"] }),
+};
+if (!(browserName in launchers)) fail(`unknown --browser "${browserName}"`);
+let browser;
+try {
+  await waitForServer();
+  browser = await launchers[browserName]();
+
+  const caseFilter = process.argv.slice(2).find((arg) => !arg.startsWith("--"));
+  for (const testCase of CASES.filter(
+    (c) => !caseFilter || c.name.includes(caseFilter),
+  )) {
+    const context = await browser.newContext({ acceptDownloads: true });
+    const page = await context.newPage();
+    const logs = [];
+    page.on("console", (msg) => logs.push(`[${msg.type()}] ${msg.text()}`));
+    page.on("pageerror", (err) => logs.push(`[pageerror] ${err.message}`));
+    page.on("dialog", (dialog) => {
+      logs.push(`[dialog] ${dialog.message()}`);
+      dialog.dismiss();
+    });
+
+    await page.goto(`${BASE}/gpu-video/video.html`);
+    await page.waitForFunction(
+      () => !document.getElementById("caps").textContent.includes("Checking"),
+      { timeout: 30_000 },
+    );
+    const caps = await page.textContent("#caps");
+    if (!caps.includes("adapter available")) {
+      fail(`WebGPU adapter unavailable: ${caps}`);
+    }
+
+    if (testCase.file) {
+      await page.setInputFiles("#videoFile", testCase.file);
+    }
+    for (const id of testCase.unchecks ?? []) {
+      await page.uncheck(`#${id}`);
+    }
+    if (useBytes) await page.uncheck("#canvasCapture");
+    if (testCase.direction) {
+      await page.selectOption("#videoDirection", testCase.direction);
+    }
+    await page.waitForFunction(() => !document.getElementById("submit").disabled);
+    await page.click("#submit");
+
+    if (testCase.cancelAfterMs) {
+      await page.waitForTimeout(testCase.cancelAfterMs);
+      await page.click("#cancel");
+    }
+
+    await page.waitForFunction(
+      () =>
+        document.getElementById("result").style.display === "block" ||
+        document.getElementById("status").textContent.startsWith("Failed") ||
+        document.getElementById("status").textContent.startsWith("Cancelled"),
+      { timeout: 240_000 },
+    );
+    const statusText = await page.textContent("#status");
+
+    if (testCase.cancelAfterMs) {
+      if (!statusText.startsWith("Cancelled")) {
+        fail(`${testCase.name}: expected "Cancelled.", got "${statusText}"`);
+      }
+      if (testCase.thenRecover) {
+        await page.setInputFiles("#videoFile", testCase.thenRecover);
+        await page.waitForFunction(() => !document.getElementById("submit").disabled, {
+          timeout: 5_000,
+        });
+        await page.click("#submit");
+        await page.waitForFunction(
+          () =>
+            document.getElementById("result").style.display === "block" ||
+            document.getElementById("status").textContent.startsWith("Failed") ||
+            document.getElementById("status").textContent.startsWith("Cancelled"),
+          { timeout: 240_000 },
+        );
+        const recovered = await page.textContent("#status");
+        if (!recovered.startsWith("Done")) {
+          fail(`${testCase.name}: page did not recover after cancel, got "${recovered}"`);
+        }
+        console.log(`ok(${testCase.name}): ${statusText} then recover Done`);
+      } else {
+        console.log(`ok(${testCase.name}): ${statusText}`);
+      }
+      await context.close();
+      continue;
+    }
+
+    if (testCase.expectError) {
+      if (!statusText.startsWith("Failed")) {
+        fail(`${testCase.name}: expected failure, got "${statusText}"`);
+      }
+      if (!testCase.expectError.test(statusText)) {
+        fail(`${testCase.name}: "${statusText}" does not match ${testCase.expectError}`);
+      }
+      console.log(`ok(${testCase.name}): ${statusText}`);
+      await context.close();
+      continue;
+    }
+
+    if (statusText.startsWith("Failed")) {
+      console.log(logs.join("\n"));
+      fail(`${testCase.name}: ${statusText}`);
+    }
+
+    const report = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll("#report tr")];
+      return Object.fromEntries(
+        rows.map((row) => [row.cells[0].textContent, row.cells[1].textContent]),
+      );
+    });
+    console.log(`report(${testCase.name}):`, report);
+
+    if (report.audio === undefined) fail(`${testCase.name}: missing audio row`);
+    if (testCase.expectAudio && !report.audio.startsWith("aac")) {
+      fail(`${testCase.name}: expected copied aac audio, got "${report.audio}"`);
+    }
+    if (
+      testCase.expectAudio === false &&
+      !/no audio|stream copy/.test(report.audio) &&
+      !/cannot be stream-copied/i.test(report.audio)
+    ) {
+      fail(`${testCase.name}: unexpected audio report entry "${report.audio}"`);
+    }
+    if (parseInt(report.frames, 10) < 180) {
+      fail(`${testCase.name}: only ${report.frames} frames encoded (expected ~189)`);
+    }
+
+    // Pull the produced file back out of the browser and validate it.
+    const bytes = await page.evaluate(async () => {
+      const response = await fetch(document.getElementById("download").href);
+      const buffer = await response.arrayBuffer();
+      let binary = "";
+      const chunk = 0x8000;
+      const view = new Uint8Array(buffer);
+      for (let i = 0; i < view.length; i += chunk) {
+        binary += String.fromCharCode(...view.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    });
+    const slug = testCase.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    const outFile = join(root, "bench", `gpu-e2e-out-${slug}.mp4`);
+    writeFileSync(outFile, Buffer.from(bytes, "base64"));
+    const output = probe(outFile);
+    execFileSync("ffmpeg", ["-v", "error", "-i", outFile, "-f", "null", "-"]);
+    if (testCase.check) {
+      try {
+        testCase.check(report, output);
+      } catch (err) {
+        fail(`${testCase.name}: ${err.message}`);
+      }
+    }
+    console.log(`ok(${testCase.name}): ${outFile}`);
+    await context.close();
+  }
+} finally {
+  await browser?.close();
+  server.kill();
+}

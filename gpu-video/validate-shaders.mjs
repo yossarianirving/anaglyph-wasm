@@ -2,15 +2,14 @@
  * WGSL validation for gpu-video/shaders.js via the `naga` CLI
  * (`cargo install naga-cli`).
  *
- * `texture_external` is Web-only (naga does not know it) and
- * `textureSampleBaseClampToEdge` takes no sampler argument, so before
- * handing a shader to naga we textually substitute them with the nearest
- * portable equivalents (`texture_2d<f32>` + `textureSample` with a dummy
- * sampler at an otherwise-unused binding). Everything else — types,
- * matrix arithmetic, storage/workgroup memory rules, control flow — is
- * validated verbatim. The script also checks the SAD kernel's workgroup
- * memory against the WebGPU spec minimum for the tile widths motion.js
- * may choose.
+ * `texture_external` is Web-only (naga does not know it), so before
+ * handing a shader to naga we textually substitute it (and the
+ * `textureSampleBaseClampToEdge` entry point, which becomes plain
+ * `textureSample` since the shaders already bind an explicit sampler).
+ * Everything else — types, matrix arithmetic, storage/workgroup memory
+ * rules, control flow — is validated verbatim. The script also checks the
+ * SAD kernel's workgroup memory against the WebGPU spec minimum for the
+ * tile widths motion.js may choose.
  *
  * Run: `node gpu-video/validate-shaders.mjs` (skips when naga is absent).
  */
@@ -34,7 +33,9 @@ if (!hasNaga) {
   process.exit(0);
 }
 
-/** Substitute external-texture constructs naga cannot parse. */
+/** Substitute external-texture constructs naga cannot parse. The shaders
+ * sample with an explicit clamp-to-edge sampler already, so the only
+ * rewrite needed is the Web-only entry point name. */
 function portable(shader) {
   return shader
     .replaceAll(
@@ -42,12 +43,8 @@ function portable(shader) {
       "texture_2d<f32>",
     )
     .replace(
-      "@group(0) @binding(0)",
-      "@group(0) @binding(99) var dummySampler: sampler;\n@group(0) @binding(0)",
-    )
-    .replace(
-      /textureSampleBaseClampToEdge\(([^,]+), ([^)]+)\)/g,
-      "textureSample($1, dummySampler, $2)",
+      /textureSampleBaseClampToEdge\(/g,
+      "textureSample(",
     );
 }
 

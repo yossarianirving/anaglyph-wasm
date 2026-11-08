@@ -13,7 +13,7 @@
  *   estimation only picks the eye order.
  * - `LUMA_SHADER`: grayscale of one frame into the R32Float analysis
  *   texture, storing `y * 255` so thresholds match the Rust estimator's
- *   0..255 domain. UVs crop the coded picture to its visible rect.
+ *   0..255 domain.
  * - `SAD_COMPUTE`: per-block best horizontal shift, SAD and variance over
  *   the small luma texture, mirroring the block matcher in motion.rs
  *   (same 8px blocks, ±12px search, first-minimum tie-break). Each
@@ -21,13 +21,34 @@
  *   workgroup memory so every texel is read from memory once; the CPU
  *   reproduces `observe`'s median + reliable-ratio over the readback.
  *
- * `texture_external` sampling (`textureSampleBaseClampToEdge`) is
+ * Coordinate convention: `FULLSCREEN_VS` emits uv with uv.y = 0 at the
+ * TOP of the destination — the WebGPU texture convention (texel row 0 is
+ * the top row, both for imported external textures and regular ones). A
+ * sampled identity copy therefore preserves orientation through blend →
+ * targetTex → blit → canvas and through the `copyTextureToBuffer` bytes
+ * path alike. Measured on Chromium: an imported VideoFrame external
+ * texture is the frame's *visible rect* (coded padding already cropped,
+ * independent of where the rect sits in the coded buffer) stored top-left
+ * origin, exactly matching ffmpeg's decoded rows.
+ *
+ * The `crop`/`flip` uniforms keep the shaders engine-quirk tolerant:
+ * `crop` (x0, y0, w, h) is in image (top-left) units and normally selects
+ * the full texture — it only trims the last row/column for odd visible
+ * dimensions; `flip` (0/1, from `probeExternalOrientation` in
+ * external.js) mirrors uv.y for a hypothetical engine that stores
+ * external textures bottom-up. Sampling maps `crop` first, then flips, so
+ * the crop window always describes image rows regardless of storage.
+ *
+ * `texture_external` sampling uses `textureSampleBaseClampToEdge(tex,
+ * samp, uv)` with an explicit clamp-to-edge sampler: the sampler-less
+ * overload was removed from WGSL (Chrome 151 rejects it). Filtering stays
  * nearest / clamp-to-edge by spec, so no manual texel pinning is needed,
  * and out-of-crop coordinates edge-replicate — the same behaviour the Rust
  * offset blend gets from its edge padding.
  */
 
-/** Shared vertex stage: fullscreen triangle carrying destination UVs. */
+/** Shared vertex stage: fullscreen triangle carrying destination UVs
+ * (uv.y = 0 at the top row, texture convention). */
 const FULLSCREEN_VS = /* wgsl */ `
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -43,20 +64,43 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
   );
   var out: VOut;
   out.pos = vec4<f32>(p[vi], 0.0, 1.0);
-  out.uv = (p[vi] + vec2<f32>(1.0, 1.0)) * 0.5;
+  out.uv = vec2<f32>((p[vi].x + 1.0) * 0.5, (1.0 - p[vi].y) * 0.5);
   return out;
 }`;
 
+/** Flip-aware crop sampling shared by the external-texture passes.
+ * `crop` selects a window in image (top-left) uv units; `flip` mirrors
+ * about the image center afterwards for bottom-up external stores. */
+const SAMPLE_CROPPED = /* wgsl */ `
+fn sampleCropped(
+  tex: texture_external,
+  uv: vec2<f32>,
+  crop: vec4<f32>,
+  flip: f32,
+) -> vec4<f32> {
+  // uv in [0,1] spans the output image; crop selects the source window
+  // (normally the full frame; odd-dimension output trims the last row
+  // or column). Out-of-range lands on the edge texel (clamp-to-edge),
+  // matching the Rust pipeline cropping before blending.
+  var src = crop.xy + uv * crop.zw;
+  if (flip > 0.5) {
+    src.y = 1.0 - src.y;
+  }
+  return textureSampleBaseClampToEdge(tex, samp, src);
+}`;
+
 /**
- * Blend pass uniforms (112 bytes, see `packBlendUniform` in gpu-pipeline.js):
+ * Blend pass uniforms (128 bytes, see `planFromFrame` in gpu-pipeline.js):
  *
- *   crop: vec4<f32>      visible-rect crop in coded-UV units (x0, y0, w, h)
- *   m0:   mat3x3<f32>    left-eye matrix (Rust rows = WGSL columns)
- *   m1:   mat3x3<f32>    right-eye matrix
+ *   crop:  vec4<f32>     source window in image uv units (x0, y0, w, h)
+ *   flags: vec4<f32>     flags.x = external-texture y flip (0/1)
+ *   m0:    mat3x3<f32>   left-eye matrix (Rust rows = WGSL columns)
+ *   m1:    mat3x3<f32>   right-eye matrix
  */
 export const BLEND_SHADER = /* wgsl */ `
 struct BlendU {
   crop: vec4<f32>,
+  flags: vec4<f32>,
   m0: mat3x3<f32>,
   m1: mat3x3<f32>,
 };
@@ -64,62 +108,52 @@ struct BlendU {
 @group(0) @binding(0) var leftTex: texture_external;
 @group(0) @binding(1) var rightTex: texture_external;
 @group(0) @binding(2) var<uniform> u: BlendU;
+// Explicit sampler for the external samples: the current WGSL spec dropped
+// the sampler-less textureSampleBaseClampToEdge overload. Addressing must
+// be clamp-to-edge (filtering is fixed by the external-texture rules).
+@group(0) @binding(3) var samp: sampler;
 
 ${FULLSCREEN_VS}
 
-// External-texture samples are sRGB-decoded to linear floats by the GPU;
-// the Rust pipeline blends gamma-encoded u8 values, so convert back with
-// the sRGB ETRF before applying the matrix. The raw linear value written
-// to the UNORM target therefore stores the same code values Rust does.
-fn srgbEncode(c: vec3<f32>) -> vec3<f32> {
-  let lo = c * 12.92;
-  let hi = max(vec3<f32>(0.0), 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055);
-  return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
-
-fn sampleCropped(tex: texture_external, uv: vec2<f32>, crop: vec4<f32>) -> vec4<f32> {
-  // uv in [0,1] spans the output image; crop selects the source window in
-  // coded-UV units. Out-of-range lands on the edge texel (clamp-to-edge),
-  // matching the Rust pipeline cropping before blending.
-  let src = crop.xy + uv * crop.zw;
-  return textureSampleBaseClampToEdge(tex, src);
-}
+// Sampling a texture_external returns display-encoded (sRGB-ish) values on
+// both Chromium/Dawn and WebKit — measured equal to the engine's own
+// drawImage()/2D-canvas conversion — which is exactly the u8 gamma domain
+// the Rust pipeline blends in. No transfer-function conversion needed.
+${SAMPLE_CROPPED}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-  let l = srgbEncode(sampleCropped(leftTex, in.uv, u.crop).rgb);
-  let r = srgbEncode(sampleCropped(rightTex, in.uv, u.crop).rgb);
+  let l = sampleCropped(leftTex, in.uv, u.crop, u.flags.x).rgb;
+  let r = sampleCropped(rightTex, in.uv, u.crop, u.flags.x).rgb;
   let color = u.m0 * l + u.m1 * r;
   return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }`;
 
 /**
- * Luma pass (16-byte uniform): `crop: vec4<f32>` as above. Writes
- * Rec.601 luma scaled to 0..255 into an R32Float target so the analysis
- * domain matches the Rust estimator's u8 input.
+ * Luma pass (32-byte uniform): `crop: vec4<f32>` + `flags: vec4<f32>`
+ * (flags.x = y flip) as in the blend shader. Writes Rec.601 luma scaled
+ * to 0..255 into an R32Float target so the analysis domain matches the
+ * Rust estimator's u8 input.
  */
 export const LUMA_SHADER = /* wgsl */ `
 struct LumaU {
   crop: vec4<f32>,
+  flags: vec4<f32>,
 };
 
 @group(0) @binding(0) var srcTex: texture_external;
 @group(0) @binding(1) var<uniform> u: LumaU;
+@group(0) @binding(2) var samp: sampler;
 
 ${FULLSCREEN_VS}
 
-// sRGB ETRF — see the note in the blend shader: external samples are
-// linear, the estimator's luma works on gamma-encoded u8 values.
-fn srgbEncode(c: vec3<f32>) -> vec3<f32> {
-  let lo = c * 12.92;
-  let hi = max(vec3<f32>(0.0), 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055);
-  return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
+// Samples are display-encoded (sRGB-ish) — the same domain the Rust
+// estimator's u8 luma works in (see the note in the blend shader).
+${SAMPLE_CROPPED}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-  let src = u.crop.xy + in.uv * u.crop.zw;
-  let c = srgbEncode(textureSampleBaseClampToEdge(srcTex, src).rgb);
+  let c = sampleCropped(srcTex, in.uv, u.crop, u.flags.x).rgb;
   let y = dot(c, vec3<f32>(0.299, 0.587, 0.114));
   return vec4<f32>(y * 255.0, 0.0, 0.0, 1.0);
 }`;

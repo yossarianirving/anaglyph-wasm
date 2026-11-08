@@ -44,6 +44,7 @@ import {
 import { createPairStrategy } from "../js/pairing.js";
 import { DirectionTracker } from "./tracker.js";
 import { BLEND_SHADER, BLIT_SHADER } from "./shaders.js";
+import { makeImporter, probeExternalOrientation } from "./external.js";
 import { GpuMotion } from "./motion.js";
 
 /** Encoded chunks handed to the decoder before it has drained. */
@@ -353,31 +354,6 @@ class GpuBufferPool {
 }
 
 /**
- * Acquire a VideoFrame as an external texture, coping with the
- * dict-vs-positional `importExternalTexture` API skew across engine
- * versions (the dict form is current spec; older builds take the frame
- * directly). The working form is remembered after the first success.
- */
-function makeImporter() {
-  let dictForm;
-  return (encoder, frame) => {
-    const tryDict = () => encoder.importExternalTexture({ externalTexture: frame });
-    const tryPositional = () => encoder.importExternalTexture(frame);
-    if (dictForm === true) return tryDict();
-    if (dictForm === false) return tryPositional();
-    try {
-      const view = tryDict();
-      dictForm = true;
-      return view;
-    } catch {
-      const view = tryPositional();
-      dictForm = false;
-      return view;
-    }
-  };
-}
-
-/**
  * Probe whether this browser can turn a WebGPU canvas into a VideoFrame —
  * the zero-copy encoder input. Draws one clear pass, submits it, and tries
  * the construction; any throw or geometry mismatch downgrades the pipeline
@@ -509,13 +485,16 @@ export async function convertVideoToAnaglyphGpu(options) {
 
   const context = gpu ?? (await createGpuContext());
   const device = context.device;
-  const importExternal = makeImporter();
+  const importExternal = makeImporter(device);
 
   const source = await inspectSource(file);
   /** @type {VideoDecoder | null} */
   let decoder = null;
   /** @type {VideoEncoder | null} */
   let encoder = null;
+  /** GPU/codec resources planned from the first decoded frame; also read
+   * by the finally block, hence declared outside the try. */
+  let core = null;
   /** @type {Map<number, object>} decoded frames not yet closed */
   const pendingEntries = new Map();
   /** @type {object[]} reversals confirmed during the run (auto mode) */
@@ -560,13 +539,13 @@ export async function convertVideoToAnaglyphGpu(options) {
     *   audioSource: EncodedAudioPacketSource | null, output: Output,
     *   videoSource: EncodedVideoPacketSource, rotationNote: string,
     *   strategy: object, motion: GpuMotion | null,
-    *   captureMode: "canvas" | "bytes", canvas: OffscreenCanvas | null,
+    *   captureMode: "canvas" | "bytes", yFlip: 0 | 1, canvas: OffscreenCanvas | null,
     *   canvasCtx: GPUCanvasContext | null, targetTex: GPUTexture,
-    *   blendU: GPUBuffer, blitBind: GPUBindGroup,
+    *   blendU: GPUBuffer, sampler: GPUSampler, blitBind: GPUBindGroup,
     *   gatePool: GpuBufferPool, pixelPool: GpuBufferPool | null,
     *   captureColorSpace: VideoColorSpaceInit | undefined,
     * } | null} */
-    let core = null;
+    core = null; // declared outside the try so the finally block can clean up
 
     /** @type {Error | null} */
     let fatalError = null;
@@ -591,8 +570,9 @@ export async function convertVideoToAnaglyphGpu(options) {
         width: videoFrame.codedWidth,
         height: videoFrame.codedHeight,
       };
-      // H.264 needs even frame dimensions; blend and encode on the cropped
-      // visible area (the shader's UV crop drops the coded padding).
+      // H.264 needs even frame dimensions; blend and encode on the visible
+      // area (the external-texture import already excludes coded padding;
+      // the crop uniform only trims for odd dimensions).
       const width = vis.width & ~1;
       const height = vis.height & ~1;
       if (width < 2 || height < 2) {
@@ -623,12 +603,19 @@ export async function convertVideoToAnaglyphGpu(options) {
         rotationNote = `${srcRot}\u00b0 (container) on ${videoFrame.codedWidth}\u00d7${videoFrame.codedHeight} frames`;
       }
 
+      // Engine stores the *visible rect* of a VideoFrame as the external
+      // texture (already cropped, top row first on spec-conforming
+      // engines); the crop uniform therefore only trims the last row or
+      // column when the even-rounded encode size is smaller than the
+      // visible rect. `flip` comes from the orientation calibration and
+      // covers a hypothetical bottom-up external store (see external.js).
       const crop = {
-        x0: vis.x / videoFrame.codedWidth,
-        y0: vis.y / videoFrame.codedHeight,
-        w: width / videoFrame.codedWidth,
-        h: height / videoFrame.codedHeight,
+        x0: 0,
+        y0: 0,
+        w: width / vis.width,
+        h: height / vis.height,
       };
+      const yFlip = await probeExternalOrientation(device, importExternal);
 
       const plan = await planEncoder(
         width,
@@ -692,15 +679,25 @@ export async function convertVideoToAnaglyphGpu(options) {
         },
         primitive: { topology: "triangle-list" },
       });
-      // BlendU: crop vec4 + two mat3x3 (112 bytes, flat row-major upload
-      // puts Rust's rows into the WGSL columns — see shaders.js).
+      // BlendU: crop vec4 + flags vec4 (x = y flip) + two mat3x3. WGSL
+      // `mat3x3` stores three vec3 columns at 16-byte stride, and
+      // `m * rgb` computes out[c] = Σ_k rgb[k] * column_c[k] — so Rust's
+      // row c (the output channel c coefficients in combine_slices)
+      // becomes WGSL column c, with the vec3 padding slot skipped.
       const blendU = device.createBuffer({
-        size: 112,
+        size: 128,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      const u32 = new ArrayBuffer(112);
-      new Float32Array(u32, 0, 4).set([crop.x0, crop.y0, crop.w, crop.h]);
-      new Float32Array(u32, 16, 18).set(matrix);
+      const u32 = new ArrayBuffer(128);
+      const uf = new Float32Array(u32);
+      uf.set([crop.x0, crop.y0, crop.w, crop.h], 0);
+      uf[4] = yFlip;
+      for (let k = 0; k < 3; k++) {
+        for (let i = 0; i < 3; i++) {
+          uf[8 + 4 * k + i] = matrix[k * 3 + i]; // m0 column k = Rust row k
+          uf[20 + 4 * k + i] = matrix[9 + k * 3 + i]; // m1
+        }
+      }
       device.queue.writeBuffer(blendU, 0, u32);
 
       const targetTex = device.createTexture({
@@ -709,8 +706,7 @@ export async function convertVideoToAnaglyphGpu(options) {
           GPUTextureUsage.RENDER_ATTACHMENT |
           GPUTextureUsage.TEXTURE_BINDING |
           GPUTextureUsage.COPY_SRC,
-        width,
-        height,
+        size: [width, height],
         sampleCount: 1,
       });
 
@@ -767,7 +763,7 @@ export async function convertVideoToAnaglyphGpu(options) {
         tracker: new DirectionTracker(direction === "auto-reverse"),
       });
       const motion = strategy.auto
-        ? new GpuMotion(device, { width, height }, crop)
+        ? new GpuMotion(device, { width, height }, crop, yFlip)
         : null;
 
       return {
@@ -782,12 +778,14 @@ export async function convertVideoToAnaglyphGpu(options) {
         strategy,
         motion,
         captureMode,
+        yFlip,
         canvas: capture?.canvas ?? null,
         canvasCtx: capture?.ctx ?? null,
         blendPipe,
         blitPipe,
         targetTex,
         blendU,
+        sampler,
         blitBind,
         gatePool,
         pixelPool,
@@ -824,16 +822,6 @@ export async function convertVideoToAnaglyphGpu(options) {
 
       const blendStart = performance.now();
       const frameEncoder = device.createCommandEncoder({ label: "blend" });
-      const leftView = importExternal(frameEncoder, pair.left.frame);
-      const rightView = importExternal(frameEncoder, pair.right.frame);
-      const blendBind = device.createBindGroup({
-        layout: core.blendPipe.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: leftView },
-          { binding: 1, resource: rightView },
-          { binding: 2, resource: { buffer: core.blendU } },
-        ],
-      });
       const pass = frameEncoder.beginRenderPass({
         colorAttachments: [
           {
@@ -842,6 +830,18 @@ export async function convertVideoToAnaglyphGpu(options) {
             loadOp: "clear",
             storeOp: "store",
           },
+        ],
+      });
+      // Imported inside the pass: external-texture views cannot leave it.
+      const leftView = importExternal(pass, pair.left.frame);
+      const rightView = importExternal(pass, pair.right.frame);
+      const blendBind = device.createBindGroup({
+        layout: core.blendPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: leftView },
+          { binding: 1, resource: rightView },
+          { binding: 2, resource: { buffer: core.blendU } },
+          { binding: 3, resource: core.sampler },
         ],
       });
       pass.setPipeline(core.blendPipe);
@@ -903,7 +903,15 @@ export async function convertVideoToAnaglyphGpu(options) {
         const data = new Uint8Array(pixels.getMappedRange().slice(0));
         pixels.unmap();
         core.pixelPool.release(pixels);
-        outFrame = new VideoFrame(data, {
+        // Compact the 256-byte-aligned readback rows into the packed
+        // layout VideoFrame(bytes) assumes (Chromium ignores or
+        // mis-handles `bytesPerRow` in the constructor — measured).
+        const rowBytes = core.width * 4;
+        const packed = new Uint8Array(rowBytes * core.height);
+        for (let y = 0; y < core.height; y++) {
+          packed.set(data.subarray(y * core.bpr, y * core.bpr + rowBytes), y * rowBytes);
+        }
+        outFrame = new VideoFrame(packed, {
           format: "BGRA",
           codedWidth: core.width,
           codedHeight: core.height,
@@ -1086,6 +1094,7 @@ export async function convertVideoToAnaglyphGpu(options) {
         blender: "WebGPU (direct)",
         frameCopy: "none (WebGPU)",
         capture: core.captureMode === "canvas" ? "canvas \u2192 VideoFrame" : "copyToBuffer \u2192 VideoFrame",
+        orientation: core.yFlip ? "bottom-up (probed)" : "top-left (spec)",
         output: `${core.width}\u00d7${core.height}`,
         rotation: core.rotationNote,
         direction: core.strategy.auto
