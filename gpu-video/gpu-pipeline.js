@@ -553,10 +553,10 @@ export async function convertVideoToAnaglyphGpu(options) {
     *   strategy: object, motion: GpuMotion | null,
     *   captureMode: "canvas" | "bytes", yFlip: 0 | 1,
     *   sourceMode: "external" | "canvas",
-    *   stageLeft: ((VideoFrame) => GPUTextureView) | null,
-    *   stageRight: ((VideoFrame) => GPUTextureView) | null,
     *   stageMotion: ((VideoFrame) => GPUTextureView) | null,
-    *   srcTexL: GPUTexture | null, srcTexR: GPUTexture | null, srcTexM: GPUTexture | null,
+    *   srcTexM: GPUTexture | null,
+    *   makeRingSlot: (() => object) | null, ringSlots: object[],
+    *   freeRingSlots: object[],
     *   canvas: OffscreenCanvas | null,
     *   canvasCtx: GPUCanvasContext | null, targetTex: GPUTexture,
     *   blendU: GPUBuffer, sampler: GPUSampler, blitBind: GPUBindGroup,
@@ -799,19 +799,19 @@ export async function convertVideoToAnaglyphGpu(options) {
         : null;
 
       // Canvas-staged frame sources for `canvas` mode (no
-      // importExternalTexture — Firefox). Each slot has a 2D scratch
+      // importExternalTexture — Firefox). Each stager has a 2D scratch
       // canvas sized to the visible rect: drawImage maps the frame's
       // visible content upright into it, then copyExternalImageToTexture
       // uploads the even-trimmed top-left region (odd visible dims drop
       // the last row/column without rescaling, matching the crop
       // uniform). Separate scratch canvases per slot keep queued copies
       // independent of later drawImage calls.
-      let srcTexL = null;
-      let srcTexR = null;
       let srcTexM = null;
-      let stageLeft = null;
-      let stageRight = null;
       let stageMotion = null;
+      /** @type {(() => object) | null} pipelined-capture ring slot factory */
+      let makeRingSlot = null;
+      /** @type {object[]} every ring slot ever created (teardown) */
+      const ringSlots = [];
       if (sourceMode === "canvas") {
         const mkStager = () => {
           const tex = device.createTexture({
@@ -822,19 +822,54 @@ export async function convertVideoToAnaglyphGpu(options) {
           const canvas = new OffscreenCanvas(vis.width, vis.height);
           const ctx = canvas.getContext("2d", { alpha: false, colorSpace: "srgb" });
           const view = tex.createView();
-          return [tex, (frame) => {
-            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-            device.queue.copyExternalImageToTexture(
-              { source: canvas },
-              { texture: tex },
-              [width, height],
-            );
-            return view;
-          }];
+          return {
+            tex,
+            stage(frame) {
+              ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+              device.queue.copyExternalImageToTexture(
+                { source: canvas },
+                { texture: tex },
+                [width, height],
+              );
+              return view;
+            },
+          };
         };
-        [srcTexL, stageLeft] = mkStager();
-        [srcTexR, stageRight] = mkStager();
-        [srcTexM, stageMotion] = mkStager();
+        const motionStager = mkStager();
+        srcTexM = motionStager.tex;
+        stageMotion = (frame) => motionStager.stage(frame);
+        // Per-pair ring slots for the pipelined capture path (see
+        // issuePairPipelined): left/right stagers plus, in canvas capture
+        // mode, a dedicated webgpu canvas for the encoder snapshot.
+        // Created on demand (up to CAPTURE_DEPTH), recycled via
+        // core.freeRingSlots once the pair's VideoFrame is encoded.
+        makeRingSlot = () => {
+          let cap = null;
+          if (captureMode === "canvas") {
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx = canvas.getContext("webgpu");
+            ctx.configure({
+              device,
+              format: context.canvasFormat,
+              alphaMode: "opaque",
+            });
+            cap = { canvas, ctx };
+          }
+          const slot = {
+            left: mkStager(),
+            right: mkStager(),
+            cap,
+            /** gate / pixel buffer while in flight */
+            buffer: null,
+            /** mapAsync promise on that buffer */
+            map: null,
+            pair: null,
+            outTimestamp: 0,
+            durationUs: 0,
+          };
+          ringSlots.push(slot);
+          return slot;
+        };
       }
 
       return {
@@ -851,12 +886,12 @@ export async function convertVideoToAnaglyphGpu(options) {
         captureMode,
         yFlip,
         sourceMode,
-        stageLeft,
-        stageRight,
         stageMotion,
-        srcTexL,
-        srcTexR,
         srcTexM,
+        makeRingSlot,
+        ringSlots,
+        /** recycled ring slots (filled by drainOldest) */
+        freeRingSlots: [],
         canvas: capture?.canvas ?? null,
         canvasCtx: capture?.ctx ?? null,
         blendPipe,
@@ -910,17 +945,11 @@ export async function convertVideoToAnaglyphGpu(options) {
           },
         ],
       });
-      // External mode imports inside the pass (views cannot leave it);
-      // canvas mode stages queue-side — queued copies run before this
-      // submission, so ordering is safe either way.
-      const leftView =
-        core.sourceMode === "external"
-          ? importExternal(pass, pair.left.frame)
-          : core.stageLeft(pair.left.frame);
-      const rightView =
-        core.sourceMode === "external"
-          ? importExternal(pass, pair.right.frame)
-          : core.stageRight(pair.right.frame);
+      // External mode imports inside the pass (external-texture views
+      // cannot leave it). Canvas/source-mode pairs take the pipelined
+      // path below instead of this function.
+      const leftView = importExternal(pass, pair.left.frame);
+      const rightView = importExternal(pass, pair.right.frame);
       const blendBind = device.createBindGroup({
         layout: core.blendPipe.getBindGroupLayout(0),
         entries: [
@@ -1016,9 +1045,171 @@ export async function convertVideoToAnaglyphGpu(options) {
       if (pairCount % 10 === 0) reportProgress();
     }
 
+    // ---- Pipelined capture (canvas source mode) ----------------------
+    //
+    // Firefox resolves mapAsync completions on a ~10 Hz GPU-process tick
+    // (bench/probe-mapasync.mjs: ~100 ms serial), so gating every pair on
+    // its own gate readback caps throughput at ~10 pairs/s regardless of
+    // GPU speed. Batches of outstanding maps DO resolve together on one
+    // tick, so canvas mode issues up to CAPTURE_DEPTH blends ahead and
+    // drains the FIFO in pair order: ~CAPTURE_DEPTH pairs per tick. Each
+    // in-flight pair owns a ring slot (its left/right frame stagers and
+    // capture canvas), so queued staging copies and canvas snapshots of
+    // different pairs never alias. The external path keeps the serial
+    // emit above — 2 ms gates on Chrome, and the iOS-verified behaviour.
+    const CAPTURE_DEPTH = 16;
+    /** @type {object[]} FIFO of in-flight ring slots (canvas mode only) */
+    const pending = [];
+
+    /** Blend one pair into a ring slot, submit, and start its gate map. */
+    async function issuePairPipelined(pair) {
+      t0Us ??= pair.timestamp;
+      const durationUs = pair.duration > 0 ? pair.duration : fallbackDurationUs;
+      const outTimestamp = pair.timestamp - t0Us;
+      while (pending.length >= CAPTURE_DEPTH) await drainOldest();
+      checkAbort();
+
+      const slot = core.freeRingSlots.pop() ?? core.makeRingSlot();
+      slot.pair = pair;
+      slot.outTimestamp = outTimestamp;
+      slot.durationUs = durationUs;
+
+      const blendStart = performance.now();
+      const frameEncoder = device.createCommandEncoder({ label: "blend" });
+      const pass = frameEncoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: core.targetTex.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      // Queue-side staging: the copyExternalImageToTexture inside runs
+      // before this submission (queue ops are submitted in order), and
+      // the slot is only recycled after this pair's gate resolved, so no
+      // later drawImage can race this pair's queued copies.
+      const leftView = slot.left.stage(pair.left.frame);
+      const rightView = slot.right.stage(pair.right.frame);
+      const blendBind = device.createBindGroup({
+        layout: core.blendPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: leftView },
+          { binding: 1, resource: rightView },
+          { binding: 2, resource: { buffer: core.blendU } },
+          { binding: 3, resource: core.sampler },
+        ],
+      });
+      pass.setPipeline(core.blendPipe);
+      pass.setBindGroup(0, blendBind);
+      pass.draw(3);
+      pass.end();
+
+      if (core.captureMode === "canvas") {
+        const canvasPass = frameEncoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: slot.cap.ctx.getCurrentTexture().createView(),
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: "clear",
+              storeOp: "store",
+            },
+          ],
+        });
+        canvasPass.setPipeline(core.blitPipe);
+        canvasPass.setBindGroup(0, core.blitBind);
+        canvasPass.draw(3);
+        canvasPass.end();
+        slot.buffer = core.gatePool.acquire();
+        frameEncoder.copyTextureToBuffer(
+          { texture: core.targetTex },
+          { buffer: slot.buffer, bytesPerRow: 256 },
+          { width: 64, height: 1 },
+        );
+      } else {
+        slot.buffer = core.pixelPool.acquire();
+        frameEncoder.copyTextureToBuffer(
+          { texture: core.targetTex },
+          { buffer: slot.buffer, bytesPerRow: core.bpr },
+          { width: core.width, height: core.height },
+        );
+      }
+      device.queue.submit([frameEncoder.finish()]);
+      stageMs.blend += performance.now() - blendStart;
+
+      // Map immediately: the map operation queues behind the copy, and
+      // the resolution batches with everything else pending on the next
+      // engine tick.
+      slot.map = slot.buffer.mapAsync(GPUMapMode.READ);
+      slot.map.catch(() => {}); // drained paths surface it; abort paths do not
+      pending.push(slot);
+    }
+
+    /** Finish the oldest in-flight pair: await its gate, snapshot the
+     * slot's result into a VideoFrame, and hand it to the encoder.
+     * Strict FIFO keeps encode timestamps monotonic. */
+    async function drainOldest() {
+      const slot = pending[0];
+      const captureStart = performance.now();
+      await withAbort(slot.map);
+      let outFrame;
+      if (core.captureMode === "canvas") {
+        // The command buffer completed (gate resolved), so the canvas
+        // snapshot is exactly this pair's blend.
+        slot.buffer.unmap();
+        outFrame = new VideoFrame(slot.cap.canvas, {
+          timestamp: slot.outTimestamp,
+          duration: slot.durationUs,
+        });
+      } else {
+        const data = new Uint8Array(slot.buffer.getMappedRange().slice(0));
+        slot.buffer.unmap();
+        // Compact the 256-byte-aligned readback rows into the packed
+        // layout VideoFrame(bytes) assumes (see emitPair).
+        const rowBytes = core.width * 4;
+        const packed = new Uint8Array(rowBytes * core.height);
+        for (let y = 0; y < core.height; y++) {
+          packed.set(
+            data.subarray(y * core.bpr, y * core.bpr + rowBytes),
+            y * rowBytes,
+          );
+        }
+        outFrame = new VideoFrame(packed, {
+          format: "BGRA",
+          codedWidth: core.width,
+          codedHeight: core.height,
+          timestamp: slot.outTimestamp,
+          duration: slot.durationUs,
+          alphaMode: "discard",
+          colorSpace: core.captureColorSpace,
+        });
+      }
+      (core.captureMode === "canvas" ? core.gatePool : core.pixelPool).release(
+        slot.buffer,
+      );
+      slot.buffer = null;
+      slot.map = null;
+      pending.shift();
+      stageMs.capture += performance.now() - captureStart;
+
+      const waitStart = performance.now();
+      await withAbort(drainQueue(encoder, "encodeQueueSize", ENCODE_QUEUE_LIMIT));
+      stageMs.encodeWait += performance.now() - waitStart;
+      encoder.encode(outFrame, { keyFrame: pairCount % keyframeEvery === 0 });
+      outFrame.close();
+      slot.pair = null;
+      core.freeRingSlots.push(slot);
+      pairCount += 1;
+      if (pairCount % 10 === 0) reportProgress();
+    }
+
     /** Close decoded frames strictly older than `releasedBefore` (their
      * pairs have all been submitted — the release is chained behind the
-     * emits that referenced them). */
+     * emits that referenced them). In canvas mode "submitted" is enough
+     * even with the pipelined capture: drawImage copies the frame's
+     * pixels into the slot's scratch canvas synchronously, so nothing
+     * downstream reads the VideoFrame itself once the issue ran. */
     function releaseFramesBefore(releasedBefore) {
       for (const [index, entry] of pendingEntries) {
         if (index >= releasedBefore) break; // insertion == index order
@@ -1029,7 +1220,11 @@ export async function convertVideoToAnaglyphGpu(options) {
 
     function enqueueEmit(pair) {
       emitChain = emitChain
-        .then(() => emitPair(pair))
+        .then(() =>
+          core.sourceMode === "canvas"
+            ? issuePairPipelined(pair)
+            : emitPair(pair),
+        )
         .catch((e) => {
           latch(e);
           try {
@@ -1128,6 +1323,9 @@ export async function convertVideoToAnaglyphGpu(options) {
     }
     await withAbort(emitChain);
     if (fatalError) throw fatalError;
+    // Final FIFO drain (canvas mode): the last issued pairs finish after
+    // the issue chain ends.
+    while (pending.length > 0) await drainOldest();
     for (const entry of pendingEntries.values()) {
       try {
         entry.frame.close();
@@ -1187,6 +1385,10 @@ export async function convertVideoToAnaglyphGpu(options) {
           core.sourceMode === "external"
             ? "importExternalTexture"
             : "drawImage + copyExternalImageToTexture",
+        captureDepth:
+          core.sourceMode === "canvas"
+            ? `pipelined x${CAPTURE_DEPTH}`
+            : "serial",
         orientation:
           core.sourceMode === "canvas"
             ? "top-left (canvas copy)"
@@ -1230,12 +1432,26 @@ export async function convertVideoToAnaglyphGpu(options) {
     pendingEntries.clear();
     core?.motion?.close();
     if (core) {
+      // In-flight ring slots may hold resolved-but-unread maps (aborted
+      // paths never drained); destroy() requires the unmapped state.
+      for (const slot of core.ringSlots ?? []) {
+        if (slot.buffer) {
+          try {
+            slot.buffer.unmap();
+          } catch {
+            /* map never resolved */
+          }
+          slot.buffer = null;
+        }
+      }
       core.targetTex.destroy();
       core.blendU.destroy();
       core.gatePool.destroy();
       core.pixelPool?.destroy();
-      for (const tex of [core.srcTexL, core.srcTexR, core.srcTexM]) {
-        tex?.destroy();
+      core.srcTexM?.destroy();
+      for (const slot of core.ringSlots ?? []) {
+        slot.left.tex.destroy();
+        slot.right.tex.destroy();
       }
     }
     if (context.ownsDevice !== false) {

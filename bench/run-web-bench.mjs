@@ -7,7 +7,12 @@
  *                                     [--browser chromium|firefox|webkit]
  *                                     [--latency quality|realtime] [--hw off]
  *                                     [--page bench-video.html]
- *                                     [--capture-bytes]
+ *                                     [--capture-bytes] [--headed]
+ *
+ * `--headed` runs a real windowed browser: required for WebGPU on hosts
+ * where headless Chromium exposes no adapter (certain Mesa stacks). It
+ * uses the system Chrome (`channel: "chrome"`) with
+ * --ignore-gpu-blocklist, matching bench/e2e-gpu.mjs.
  *
  * `--page` selects the bench page under test; point it at
  * `gpu-video/bench.html` to benchmark the all-GPU pipeline (run both pages
@@ -43,11 +48,14 @@ const BASE = `http://localhost:${PORT}`;
 const NATIVE = join(root, "..", "anaglyph-rs", "target", "release", "anaglyph-rs");
 
 const argValue = (name, fallback) => {
+  const inline = process.argv.find((a) => a.startsWith(name + "="));
+  if (inline !== undefined) return inline.slice(name.length + 1);
   const index = process.argv.indexOf(name);
   return index > -1 ? process.argv[index + 1] : fallback;
 };
 const ITERS = parseInt(argValue("--iters", "3"), 10);
 const WITH_GPU = process.argv.includes("--gpu");
+const HEADED = process.argv.includes("--headed");
 const SKIP_NATIVE = process.argv.includes("--skip-native");
 const BROWSER = argValue("--browser", "chromium");
 const LATENCY = argValue("--latency", "quality");
@@ -63,10 +71,14 @@ const GPU_PAGE = PAGE.startsWith("gpu-video");
 // set; `--webm` forces the same set on every browser for apples-to-apples
 // cross-browser runs. WebKitGTK decodes VP9/VP8 through GStreamer.
 const WEBM_CLIPS = ["bench/booth2s-vp9.webm", "bench/boomerang-vp9.webm"];
+const MP4_CLIPS = ["bench/booth2s.mp4", "bench/booth2s-aac.mp4", "bench/boomerang.mp4"];
 const CLIPS =
   BROWSER === "firefox" || BROWSER === "webkit" || process.argv.includes("--webm")
     ? WEBM_CLIPS
-    : ["bench/booth2s.mp4", "bench/booth2s-aac.mp4", "bench/boomerang.mp4"];
+    : MP4_CLIPS;
+// `--mp4` forces the MP4 set even on Firefox (diagnosing decode-codec
+// effects; requires a Firefox build that actually decodes H.264).
+if (process.argv.includes("--mp4")) CLIPS.splice(0, CLIPS.length, ...MP4_CLIPS);
 
 /** Web runs: CPU blend everywhere; `auto` direction costs motion analysis. */
 const webRuns = [];
@@ -114,14 +126,19 @@ async function openPage() {
   if (BROWSER !== "webkit") {
     const browser =
       BROWSER === "firefox"
-        ? await firefox.launch({ headless: true })
+        ? await firefox.launch({
+            headless: !HEADED,
+            firefoxUserPrefs: { "dom.webgpu.enabled": true, "gfx.webrender.all": true },
+          })
         : await chromium.launch({
-            headless: true,
+            headless: !HEADED,
             // --gpu: full chromium (headless=new) without SwiftShader pinning, so a
             // machine with a real GPU actually uses it; the default headless shell
             // cannot reach WebGPU/hardware codecs at all.
-            ...(WITH_GPU ? { channel: "chromium" } : {}),
-            args: WITH_GPU
+            // --headed: system Chrome windowed, the config proven to reach the
+            // hardware adapter where headless cannot (see e2e-gpu.mjs).
+            ...(HEADED ? { channel: "chrome" } : WITH_GPU ? { channel: "chromium" } : {}),
+            args: WITH_GPU || HEADED
               ? ["--ignore-gpu-blocklist"]
               : ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
           });
@@ -234,6 +251,9 @@ try {
   for (const run of webRuns) {
     const query = new URLSearchParams({
       ...run,
+      // gpu-video/bench.html resolves its clip relative to its own
+      // directory; the wasm page lives at the root.
+      clip: GPU_PAGE ? `../${run.clip}` : run.clip,
       iters: String(ITERS),
       autorun: "1",
       latency: LATENCY,
@@ -283,7 +303,7 @@ try {
     browser: BROWSER,
     latency: LATENCY,
     hw: HW,
-    headless: !WITH_GPU,
+    headless: !(WITH_GPU || HEADED),
     webMeta: web[0]?.meta ?? null,
     web: web.map((run) => ({
       clip: run.clip,
