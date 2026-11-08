@@ -1,0 +1,402 @@
+<html>
+    <head>
+        <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            crossorigin="anonymous"
+        />
+        <title>Anaglyph video converter (pure WebGPU)</title>
+    </head>
+    <body>
+        <main class="container py-3">
+            <p>
+                <a href="../index.html">image converter</a> &middot;
+                <a href="../video.html">WebCodecs pipeline</a>
+            </p>
+            <h1>Video &rarr; anaglyph 3-D <span class="badge bg-info">WebGPU</span></h1>
+            <p class="text-muted">
+                The all-GPU pipeline: JavaScript + WebGPU + mediabunny only
+                (no wasm). Decoded frames stay on the GPU from the decoder to
+                the encoder &mdash; blending, the luma/box/SAD motion passes
+                and the encoder capture all run as GPU passes, so nothing
+                copies megabytes across the CPU boundary. Same features as the
+                WebCodecs pipeline: fixed or auto eye pairing with boomerang
+                reversal detection, five anaglyph types, audio stream-copy,
+                H.264/VP9/VP8/AV1 output.
+            </p>
+
+            <div id="caps" class="alert alert-secondary py-2">
+                Checking browser capabilities&hellip;
+            </div>
+
+            <form id="videoForm">
+                <div class="mb-3">
+                    <label for="videoFile" class="form-label">Upload video:</label>
+                    <input
+                        class="form-control"
+                        type="file"
+                        id="videoFile"
+                        accept="video/*"
+                    />
+                    <button
+                        type="button"
+                        class="btn btn-outline-secondary btn-sm mt-2"
+                        id="useSample"
+                    >
+                        Use bundled sample clip
+                    </button>
+                </div>
+                <div class="row">
+                    <div class="col-md-5 mb-3">
+                        <label for="videoDirection" class="form-label"
+                            >Camera direction:</label
+                        >
+                        <select class="form-select" id="videoDirection">
+                            <option value="clockwise" selected>
+                                clockwise (newer frame = left eye)
+                            </option>
+                            <option value="counter-clockwise">
+                                counter-clockwise (older frame = left eye)
+                            </option>
+                            <option value="auto">auto (detect orbit, swap on reversal)</option>
+                            <option value="auto-reverse">auto, reversed mapping</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <label for="anaglyphType" class="form-label"
+                            >Anaglyph type:</label
+                        >
+                        <select class="form-select" id="anaglyphType">
+                            <option value="color" selected>color (red / cyan)</option>
+                            <option value="half-color">half-color</option>
+                            <option value="grayscale">grayscale (anaglyph classic)</option>
+                            <option value="optimized">optimized (dubois-ish)</option>
+                            <option value="true">true (luma only)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-md-4 mb-3">
+                        <div class="form-check">
+                            <input
+                                class="form-check-input"
+                                type="checkbox"
+                                checked
+                                id="hwDecode"
+                            />
+                            <label class="form-check-label" for="hwDecode"
+                                >Hardware decode</label
+                            >
+                        </div>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <div class="form-check">
+                            <input
+                                class="form-check-input"
+                                type="checkbox"
+                                checked
+                                id="hwEncode"
+                            />
+                            <label class="form-check-label" for="hwEncode"
+                                >Hardware encode</label
+                            >
+                        </div>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <div class="form-check">
+                            <input
+                                class="form-check-input"
+                                type="checkbox"
+                                checked
+                                id="canvasCapture"
+                            />
+                            <label class="form-check-label" for="canvasCapture"
+                                >Canvas capture (zero-copy encode)</label
+                            >
+                        </div>
+                    </div>
+                </div>
+
+                <button
+                    type="submit"
+                    class="btn btn-primary"
+                    id="submit"
+                    disabled
+                >
+                    Convert
+                </button>
+                <button
+                    type="button"
+                    class="btn btn-outline-danger ms-2"
+                    id="cancel"
+                    style="display: none"
+                >
+                    Cancel
+                </button>
+            </form>
+
+            <div class="mt-3" id="progressWrap" style="display: none">
+                <div
+                    class="progress"
+                    role="progressbar"
+                    aria-label="Conversion progress"
+                    style="height: 1.5rem"
+                >
+                    <div
+                        id="progressBar"
+                        class="progress-bar progress-bar-striped bg-info"
+                        style="width: 0%"
+                    ></div>
+                </div>
+                <span id="status" class="text-muted" aria-live="polite"></span>
+            </div>
+
+            <div id="result" class="mt-3" style="display: none">
+                <video
+                    id="resultVideo"
+                    controls
+                    style="max-width: 95%"
+                ></video>
+                <p class="mt-2">
+                    <a id="download" class="btn btn-success" download="anaglyph.mp4"
+                        >Download result</a
+                    >
+                </p>
+                <table class="table table-sm table-striped" id="report" style="max-width: 42rem"></table>
+            </div>
+        </main>
+        <script type="module">
+            var worker = new Worker("gpu-worker.js", { type: "module" });
+            var pickedFile = null;
+            var objectUrl = null;
+            var cancelWatchdog = null;
+
+            var submit = document.getElementById("submit");
+            var cancel = document.getElementById("cancel");
+            var progressWrap = document.getElementById("progressWrap");
+            var progressBar = document.getElementById("progressBar");
+            var statusEl = document.getElementById("status");
+
+            /**
+             * Tear down and rebuild the worker (last-resort recovery from a
+             * conversion that refused to die; see video.html for the full
+             * rationale).
+             */
+            function recreateWorker() {
+                if (worker) worker.terminate();
+                worker = new Worker("gpu-worker.js", { type: "module" });
+            }
+
+            worker.onmessage = function (e) {
+                switch (e.data.type) {
+                    case "video-progress":
+                        clearWatchdog();
+                        setProgress(e.data);
+                        break;
+                    case "video-result":
+                        clearWatchdog();
+                        showResult(e.data.url, e.data.report);
+                        setBusy(false);
+                        break;
+                    case "video-cancelled":
+                        clearWatchdog();
+                        setStatus("Cancelled.");
+                        setBusy(false);
+                        break;
+                    case "anaglyph-error":
+                        clearWatchdog();
+                        setStatus("Failed: " + e.data.message);
+                        setBusy(false);
+                        break;
+                    default:
+                        break;
+                }
+            };
+
+            worker.onerror = function (e) {
+                clearWatchdog();
+                setStatus(
+                    "Failed: worker error" +
+                        (e.message ? " — " + e.message : "") +
+                        ". You can try again.",
+                );
+                recreateWorker();
+                setBusy(false);
+            };
+
+            function clearWatchdog() {
+                if (cancelWatchdog) {
+                    clearTimeout(cancelWatchdog);
+                    cancelWatchdog = null;
+                }
+            }
+
+            function setStatus(text) {
+                statusEl.textContent = text;
+            }
+
+            function setBusy(busy) {
+                submit.disabled = !pickedFile || busy;
+                cancel.style.display = busy ? "inline-block" : "none";
+                progressWrap.style.display = busy ? "block" : progressWrap.style.display;
+            }
+
+            function setProgress(s) {
+                progressWrap.style.display = "block";
+                var pct = s.totalFrames
+                    ? Math.min(100, Math.round((100 * s.frames) / s.totalFrames))
+                    : 0;
+                progressBar.style.width = pct + "%";
+                setStatus(
+                    s.frames +
+                        (s.totalFrames ? " / " + s.totalFrames : "") +
+                        " frames  ·  " +
+                        s.fps.toFixed(1) +
+                        " fps  ·  WebGPU" +
+                        (s.auto && s.reversals
+                            ? "  ·  reversals: " + s.reversals
+                            : ""),
+                );
+            }
+
+            function showResult(url, report) {
+                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                objectUrl = url;
+                var video = document.getElementById("resultVideo");
+                video.src = url;
+                var download = document.getElementById("download");
+                download.href = url;
+                download.download =
+                    "anaglyph." + (report.container === "webm" ? "webm" : "mp4");
+                var table = document.getElementById("report");
+                table.innerHTML = "";
+                for (const [key, value] of Object.entries(report)) {
+                    var row = table.insertRow();
+                    row.insertCell().textContent = key;
+                    row.insertCell().textContent =
+                        key === "fps" && typeof value === "number"
+                            ? value.toFixed(1)
+                            : key === "seconds" && typeof value === "number"
+                              ? value.toFixed(2) + " s"
+                              : String(value);
+                }
+                document.getElementById("result").style.display = "block";
+                setStatus("Done.");
+            }
+
+            function setFile(file) {
+                pickedFile = file;
+                setBusy(false);
+                if (file) {
+                    setStatus(
+                        "Ready: " + file.name + " (" + Math.round(file.size / 1e6) + " MB)",
+                    );
+                }
+            }
+
+            document
+                .getElementById("videoFile")
+                .addEventListener("change", function (e) {
+                    setFile(e.target.files[0] || null);
+                });
+
+            document
+                .getElementById("useSample")
+                .addEventListener("click", async function () {
+                    setStatus("Loading sample clip…");
+                    // Same fixture as the WebCodecs page; ?sample= overrides.
+                    var samplePath =
+                        new URLSearchParams(location.search).get("sample") ||
+                        "../bench/booth2s.mp4";
+                    var response = await fetch(samplePath);
+                    if (!response.ok) {
+                        setStatus("Could not load the sample clip.");
+                        return;
+                    }
+                    var blob = await response.blob();
+                    var name = samplePath.split("/").pop();
+                    setFile(new File([blob], name, { type: blob.type }));
+                });
+
+            document
+                .getElementById("videoForm")
+                .addEventListener("submit", function (event) {
+                    event.preventDefault();
+                    setBusy(true);
+                    progressWrap.style.display = "block";
+                    progressBar.style.width = "0%";
+                    setStatus("Starting…");
+                    worker.postMessage({
+                        type: "convert-video",
+                        file: pickedFile,
+                        direction: document.getElementById("videoDirection").value,
+                        anaglyphType: document.getElementById("anaglyphType").value,
+                        acceleration: {
+                            decode: document.getElementById("hwDecode").checked,
+                            encode: document.getElementById("hwEncode").checked,
+                        },
+                        canvasCapture: document.getElementById("canvasCapture").checked,
+                    });
+                });
+
+            cancel.addEventListener("click", function () {
+                setStatus("Cancelling…");
+                worker.postMessage({ type: "cancel-video" });
+                // Grace period for the cooperative cancel; force-reset the
+                // worker if the engine strands a codec await.
+                clearWatchdog();
+                var name = pickedFile && pickedFile.name;
+                cancelWatchdog = setTimeout(function () {
+                    cancelWatchdog = null;
+                    recreateWorker();
+                    setStatus(
+                        "Cancelled. The stuck worker was reset" +
+                            (name ? "; pick \u201c" + name + "\u201d again" : "") +
+                            ".",
+                    );
+                    setBusy(false);
+                }, 1500);
+            });
+
+            // Capability banner: this page has no CPU fallback — WebGPU and
+            // WebCodecs are both mandatory (the point of the experiment).
+            (async function () {
+                var lines = [];
+                var hasCodecs =
+                    typeof VideoDecoder !== "undefined" &&
+                    typeof VideoEncoder !== "undefined";
+                var gpuOk = false;
+                if (navigator.gpu) {
+                    var adapter = await navigator.gpu.requestAdapter().catch(function () {
+                        return null;
+                    });
+                    gpuOk = !!adapter;
+                }
+                lines.push(
+                    "WebGPU: " + (gpuOk ? "adapter available" : "NOT available — this pipeline needs WebGPU (iOS Safari 18+)"),
+                );
+                lines.push(
+                    "WebCodecs: " + (hasCodecs ? "supported" : "NOT supported"),
+                );
+                if (hasCodecs && gpuOk) {
+                    var avc = await VideoEncoder.isConfigSupported({
+                        codec: "avc1.640028",
+                        width: 1920,
+                        height: 1080,
+                    }).catch(function () {
+                        return { supported: false };
+                    });
+                    lines.push(
+                        "H.264 encode: " + (avc.supported ? "supported" : "not available (WebM fallback will be used)"),
+                    );
+                }
+                var caps = document.getElementById("caps");
+                caps.textContent = lines.join("  ·  ");
+                caps.className =
+                    "alert py-2 " + (hasCodecs && gpuOk ? "alert-secondary" : "alert-warning");
+            })();
+        </script>
+    </body>
+</html>

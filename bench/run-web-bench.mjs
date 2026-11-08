@@ -6,6 +6,14 @@
  * Usage: node bench/run-web-bench.mjs [--iters N] [--gpu] [--skip-native]
  *                                     [--browser chromium|firefox|webkit]
  *                                     [--latency quality|realtime] [--hw off]
+ *                                     [--page bench-video.html]
+ *                                     [--capture-bytes]
+ *
+ * `--page` selects the bench page under test; point it at
+ * `gpu-video/bench.html` to benchmark the all-GPU pipeline (run both pages
+ * in one command sequence to A/B against the wasm pipeline). On GPU pages
+ * the backend column shows the encoder capture path, and `--capture-bytes`
+ * adds the readback-encode variants next to the zero-copy canvas ones.
  *
  * Results land in bench/results/web-<timestamp>.json (and
  * bench/results/latest.md as a markdown summary). Read them with
@@ -47,6 +55,9 @@ const LATENCY = argValue("--latency", "quality");
 const CODEC = argValue("--codec", null);
 // `--hw off` disables hardware decode AND encode preferences.
 const HW = argValue("--hw", "on");
+// Which bench page to drive (the GPU pipeline lives on its own page).
+const PAGE = argValue("--page", "bench-video.html");
+const GPU_PAGE = PAGE.startsWith("gpu-video");
 
 // Firefox (and any browser compared against it) uses the open-codec WebM
 // set; `--webm` forces the same set on every browser for apples-to-apples
@@ -60,10 +71,25 @@ const CLIPS =
 /** Web runs: CPU blend everywhere; `auto` direction costs motion analysis. */
 const webRuns = [];
 for (const clip of CLIPS) {
+  if (GPU_PAGE) {
+    // The all-GPU pipeline: capture path replaces the blend backend, and
+    // it always runs its GPU variant (no CPU blend exists).
+    webRuns.push({ clip, direction: "clockwise", backend: "capture=canvas", capture: "canvas" });
+    if (!clip.includes("aac")) {
+      webRuns.push({ clip, direction: "auto", backend: "capture=canvas", capture: "canvas" });
+    }
+    if (process.argv.includes("--capture-bytes")) {
+      webRuns.push({ clip, direction: "clockwise", backend: "capture=bytes", capture: "bytes" });
+      if (!clip.includes("aac")) {
+        webRuns.push({ clip, direction: "auto", backend: "capture=bytes", capture: "bytes" });
+      }
+    }
+    continue;
+  }
   webRuns.push({ clip, direction: "clockwise", backend: "cpu" });
   if (!clip.includes("aac")) webRuns.push({ clip, direction: "auto", backend: "cpu" });
 }
-if (WITH_GPU) {
+if (WITH_GPU && !GPU_PAGE) {
   // The interesting comparison on real hardware: WebGPU blend vs CPU blend.
   for (const run of [...webRuns]) {
     webRuns.push({ ...run, backend: "auto" });
@@ -172,7 +198,7 @@ async function openPage() {
 async function waitForServer(retries = 30) {
   for (let i = 0; i < retries; i++) {
     try {
-      await fetch(`${BASE}/bench-video.html`);
+      await fetch(`${BASE}/${PAGE}`);
       return;
     } catch {
       await new Promise((r) => setTimeout(r, 200));
@@ -211,13 +237,14 @@ try {
       iters: String(ITERS),
       autorun: "1",
       latency: LATENCY,
+      ...(GPU_PAGE ? { capture: run.capture } : {}),
       ...(CODEC ? { codec: CODEC } : {}),
       ...(HW === "off" ? { hwDecode: "0", hwEncode: "0" } : {}),
     });
     process.stdout.write(`web ${run.clip} ${run.direction}/${run.backend} … `);
     let result;
     try {
-      result = await page.runBench(`${BASE}/bench-video.html?${query}`, 600_000);
+      result = await page.runBench(`${BASE}/${PAGE}?${query}`, 600_000);
     } catch (err) {
       result = { clip: run.clip, direction: run.direction, backend: run.backend, error: String(err) };
     }
@@ -268,13 +295,14 @@ try {
       medianFps: run.iters.length ? median(run.iters.map((r) => r.fps)) : null,
       medianStageMs: run.iters.length
         ? Object.fromEntries(
-            ["copy", "blend", "motion", "encodeWait", "decodeWait"].map((k) => [
+            ["copy", "blend", "capture", "motion", "encodeWait", "decodeWait"].map((k) => [
               k,
               median(run.iters.map((r) => r.stageMs?.[k] ?? 0)),
             ]),
           )
         : null,
       iterations: run.iters,
+      capture: run.iters[0]?.capture ?? null,
       decodeOnly: run.decodeOnly,
       blendOnly: run.blendOnly,
       encodeOnly: run.encodeOnly,

@@ -194,6 +194,47 @@ Native CLI (`-b cpu`, VAAPI h264 encode, wall-clock incl. process start):
 Native runs on 5-second clips are dominated by process/encoder startup;
 the 11-second boomerang shows the steady state (~1200 frames/s).
 
+## All-GPU pipeline A/B (`gpu-video/`)
+
+[`gpu-video/`](gpu-video/README.md) is a from-scratch second implementation
+(JS + WebGPU + mediabunny, no wasm) that keeps decoded frames GPU-resident
+end to end — it exists to remove the `copyTo` floor described above. Its
+bench page (`gpu-video/bench.html`) mirrors this file's
+`window.__benchResults` contract, so the same runner drives both pipelines:
+
+```sh
+# wasm pipeline (baseline, unchanged):
+node bench/run-web-bench.mjs --skip-native --iters 5
+# all-GPU pipeline:
+node bench/run-web-bench.mjs --skip-native --iters 5 --page gpu-video/bench.html
+# also run the readback-encode variant next to the zero-copy canvas one:
+node bench/run-web-bench.mjs --skip-native --page gpu-video/bench.html --capture-bytes
+```
+
+`--page` switches the run matrix to the GPU page's knobs: the *backend*
+column becomes the encoder-input path (`capture=canvas` / `capture=bytes`)
+instead of the wasm blend backend, and the stage columns gain **capture**
+(GPU completion gate + encoder-input snapshot). `copy` is always 0 there —
+the pipeline has no CPU frame copy by construction. Diff as usual with
+`node bench/compare.mjs`.
+
+- **Requires a WebGPU adapter.** In this dev container no engine exposes
+  one (probed Chromium/Chrome/Firefox/WebKitGTK — all lack `navigator.gpu`),
+  so the GPU-page rows fail there by design; run the A/B on any desktop
+  with WebGPU (Chrome `--use-angle=metal` on macOS, Safari 18+, or a Linux
+  box with ANV/RADV) or on the iPhone:
+- **On the iPhone** serve the repo over HTTPS and open
+  `gpu-video/bench.html?autorun=1` (clockwise, canvas capture, 3 iterations)
+  and, as the baseline, `bench-video.html?autorun=1`. Both pages show a
+  **Copy JSON** button — grab each result and diff the `iters` arrays;
+  `webMeta`/`meta` records UA + adapter so runs are attributable.
+- Expected shape (from the copy-cost model, to be confirmed on device): on
+  WebKit-class engines the wasm pipeline pays ~2.8 ms/pair of fixed
+  `copyTo` round trips; the GPU pipeline replaces that with a blend submit +
+  a 256 B gate on the canvas path, so the gap should be widest exactly where
+  the wasm pipeline is copy-bound, and near-zero on a machine whose encoder
+  is the bottleneck (Firefox-style encode-bound runs).
+
 ## Engine notes (WebKit / Safari / iOS)
 
 Verified against WebKitGTK 2.54.2 (GNOME Web, driven by

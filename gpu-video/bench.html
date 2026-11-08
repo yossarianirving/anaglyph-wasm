@@ -1,0 +1,501 @@
+<html>
+    <head>
+        <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            crossorigin="anonymous"
+        />
+        <title>WebGPU video pipeline benchmark</title>
+    </head>
+    <body>
+        <main class="container py-3" style="max-width: 64rem">
+            <p>
+                <a href="video.html">webgpu converter</a> &middot;
+                <a href="../bench-video.html">webcodecs bench</a>
+            </p>
+            <h1>WebGPU pipeline benchmark</h1>
+            <p class="text-muted">
+                Times the all-GPU pipeline end to end
+                (demux &rarr; decode &rarr; pair &rarr; GPU blend &rarr;
+                capture &rarr; encode &rarr; mux) plus decode-only and
+                encode-only bounds. Mirrors the
+                <code>window.__benchResults</code> contract of the WebCodecs
+                bench page, so <code>bench/run-web-bench.mjs --page</code>
+                drives both. First iteration includes warm-up costs; the
+                harness reports medians. Use &ldquo;Copy JSON&rdquo; to grab
+                results on a phone.
+            </p>
+
+            <form id="benchForm" class="row g-2 align-items-end">
+                <div class="col-md-4">
+                    <label class="form-label" for="clip">Clip</label>
+                    <select class="form-select" id="clip">
+                        <option value="../bench/booth2s.mp4">booth2s (5.7s)</option>
+                        <option value="../bench/booth2s-aac.mp4">
+                            booth2s-aac (5.7s)
+                        </option>
+                        <option value="../bench/boomerang.mp4">
+                            boomerang (11.3s)
+                        </option>
+                        <option value="../bench/booth2s-vp9.webm">
+                            booth2s VP9/WebM
+                        </option>
+                        <option value="../bench/boomerang-vp9.webm">
+                            boomerang VP9/WebM
+                        </option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="direction">Direction</label>
+                    <select class="form-select" id="direction">
+                        <option value="clockwise">clockwise</option>
+                        <option value="auto">auto</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="capture">Encoder input</label>
+                    <select class="form-select" id="capture">
+                        <option value="canvas">canvas (zero-copy)</option>
+                        <option value="bytes">readback (BGRA bytes)</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="iters">Iterations</label>
+                    <input
+                        class="form-control"
+                        id="iters"
+                        type="number"
+                        min="1"
+                        max="20"
+                        value="3"
+                    />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label d-block">Codecs / hardware</label>
+                    <div class="form-check form-check-inline">
+                        <input
+                            class="form-check-input"
+                            type="checkbox"
+                            id="hwDecode"
+                            checked
+                        />
+                        <label class="form-check-label" for="hwDecode">HW decode</label>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input
+                            class="form-check-input"
+                            type="checkbox"
+                            id="hwEncode"
+                            checked
+                        />
+                        <label class="form-check-label" for="hwEncode">HW encode</label>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="latency">Latency mode</label>
+                    <select class="form-select" id="latency">
+                        <option value="quality">quality</option>
+                        <option value="realtime">realtime</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="codec">Codec hint</label>
+                    <select class="form-select" id="codec">
+                        <option value="">auto</option>
+                        <option value="avc">avc</option>
+                        <option value="vp9">vp9</option>
+                        <option value="vp8">vp8</option>
+                        <option value="av1">av1</option>
+                    </select>
+                </div>
+                <div class="col-md-3 d-flex gap-2">
+                    <button type="submit" class="btn btn-primary" id="run">Run</button>
+                    <button
+                        type="button"
+                        class="btn btn-outline-secondary"
+                        id="copyJson"
+                        disabled
+                    >
+                        Copy JSON
+                    </button>
+                </div>
+            </form>
+
+            <p id="status" class="text-muted mt-2" aria-live="polite"></p>
+
+            <table class="table table-sm table-striped mt-2" id="results" style="display: none"></table>
+        </main>
+        <script type="module">
+            import {
+                ALL_FORMATS,
+                BlobSource,
+                EncodedPacketSink,
+                Input,
+            } from "../vendor/mediabunny.mjs";
+            import {
+                convertVideoToAnaglyphGpu,
+                createGpuContext,
+            } from "./gpu-pipeline.js";
+
+            window.__benchResults = null;
+
+            const params = new URLSearchParams(location.search);
+            const statusEl = document.getElementById("status");
+            const resultsEl = document.getElementById("results");
+            const runButton = document.getElementById("run");
+            const copyButton = document.getElementById("copyJson");
+
+            // Autorun for the harness:
+            //   gpu-video/bench.html?clip=../bench/booth2s.mp4&iters=3&autorun=1
+            if (params.get("autorun")) {
+                document.getElementById("clip").value =
+                    params.get("clip") || "../bench/booth2s.mp4";
+                document.getElementById("direction").value =
+                    params.get("direction") || "clockwise";
+                document.getElementById("iters").value = params.get("iters") || "3";
+                document.getElementById("capture").value =
+                    params.get("capture") || "canvas";
+                document.getElementById("latency").value =
+                    params.get("latency") || "quality";
+                if (params.get("codec")) document.getElementById("codec").value = params.get("codec");
+                if (params.get("hwDecode") === "0")
+                    document.getElementById("hwDecode").checked = false;
+                if (params.get("hwEncode") === "0")
+                    document.getElementById("hwEncode").checked = false;
+                runBench();
+            }
+
+            document.getElementById("benchForm").addEventListener("submit", (e) => {
+                e.preventDefault();
+                runBench();
+            });
+
+            copyButton.addEventListener("click", async () => {
+                if (!window.__benchResults) return;
+                const text = JSON.stringify(window.__benchResults, null, 2);
+                try {
+                    await navigator.clipboard.writeText(text);
+                    statusEl.textContent = "JSON copied to clipboard.";
+                } catch {
+                    statusEl.textContent = "Clipboard blocked — open the console and copy window.__benchResults.";
+                }
+            });
+
+            async function fetchSample(url) {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`could not fetch ${url}`);
+                const blob = await response.blob();
+                return new File([blob], url.split("/").pop(), { type: blob.type });
+            }
+
+            /** Decode the whole clip and drop every frame (no copies): the
+             * decoder ceiling for this engine. */
+            async function benchDecode(file) {
+                const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+                try {
+                    const track = await input.getPrimaryVideoTrack();
+                    const config = await track.getDecoderConfig();
+                    let frames = 0;
+                    let decoderError = null;
+                    const decoder = new VideoDecoder({
+                        output(frame) {
+                            frames += 1;
+                            frame.close();
+                        },
+                        error(e) {
+                            decoderError = e;
+                        },
+                    });
+                    decoder.configure(config);
+                    const started = performance.now();
+                    const sink = new EncodedPacketSink(track);
+                    for await (const packet of sink.packets()) {
+                        if (decoderError) throw decoderError;
+                        decoder.decode(packet.toEncodedVideoChunk());
+                        while (decoder.decodeQueueSize > 32) {
+                            await new Promise((r) =>
+                                decoder.addEventListener("dequeue", r, { once: true }),
+                            );
+                        }
+                    }
+                    await decoder.flush();
+                    decoder.close();
+                    if (decoderError) throw decoderError;
+                    const seconds = (performance.now() - started) / 1e3;
+                    return { frames, seconds, fps: frames / seconds };
+                } finally {
+                    input.dispose();
+                }
+            }
+
+            /**
+             * Encode N frames with the same capture path the pipeline uses
+             * (canvas snapshot or reused RGBA bytes), no demux/decode/blend:
+             * the encoder + capture ceiling.
+             */
+            async function benchEncode(file, mode, frameCount) {
+                const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+                let width = 1280;
+                let height = 720;
+                try {
+                    const track = await input.getPrimaryVideoTrack();
+                    width = (await track.getDisplayWidth()) & ~1;
+                    height = (await track.getDisplayHeight()) & ~1;
+                } finally {
+                    input.dispose();
+                }
+                const codec = "avc1.640028";
+                const config = {
+                    codec,
+                    width,
+                    height,
+                    framerate: 30,
+                    bitrate: 6_000_000,
+                    latencyMode: "quality",
+                    avc: { format: "avc" },
+                };
+                const support = await VideoEncoder.isConfigSupported(config).catch(
+                    () => ({ supported: false }),
+                );
+                if (!support.supported) return { error: "H.264 encode unsupported" };
+
+                const gpu = await createGpuContext();
+                const encoder = new VideoEncoder({ output: () => {} , error: (e) => { throw e; } });
+                encoder.configure(config);
+                const started = performance.now();
+                let encoded = 0;
+                try {
+                    if (mode === "canvas") {
+                        const canvas = new OffscreenCanvas(width, height);
+                        const ctx = canvas.getContext("webgpu");
+                        ctx.configure({ device: gpu.device, format: gpu.canvasFormat, alphaMode: "opaque" });
+                        const pass = gpu.device.createCommandEncoder().beginRenderPass({
+                            colorAttachments: [
+                                {
+                                    view: ctx.getCurrentTexture().createView(),
+                                    clearValue: { r: 0.1, g: 0.2, b: 0.3, a: 1 },
+                                    loadOp: "clear",
+                                    storeOp: "store",
+                                },
+                            ],
+                        });
+                        pass.end();
+                        // One clear pass per encoded frame: the per-pair
+                        // canvas write cost, without the blend/import work.
+                        for (let i = 0; i < frameCount; i++) {
+                            const enc2 = gpu.device.createCommandEncoder();
+                            const p = enc2.beginRenderPass({
+                                colorAttachments: [
+                                    {
+                                        view: ctx.getCurrentTexture().createView(),
+                                        clearValue: { r: (i % 8) / 8, g: 0.2, b: 0.3, a: 1 },
+                                        loadOp: "clear",
+                                        storeOp: "store",
+                                    },
+                                ],
+                            });
+                            p.end();
+                            gpu.device.queue.submit([enc2.finish()]);
+                            const frame = new VideoFrame(canvas, { timestamp: i * 33333, duration: 33333 });
+                            encoder.encode(frame, { keyFrame: i % 60 === 0 });
+                            frame.close();
+                            encoded += 1;
+                            while (encoder.encodeQueueSize > 8) {
+                                await new Promise((r) => encoder.addEventListener("dequeue", r, { once: true }));
+                            }
+                        }
+                    } else {
+                        const data = new Uint8Array(width * height * 4);
+                        for (let i = 0; i < frameCount; i++) {
+                            const frame = new VideoFrame(data, {
+                                format: "RGBA",
+                                codedWidth: width,
+                                codedHeight: height,
+                                timestamp: i * 33333,
+                                duration: 33333,
+                            });
+                            encoder.encode(frame, { keyFrame: i % 60 === 0 });
+                            frame.close();
+                            encoded += 1;
+                            while (encoder.encodeQueueSize > 8) {
+                                await new Promise((r) => encoder.addEventListener("dequeue", r, { once: true }));
+                            }
+                        }
+                    }
+                    await encoder.flush();
+                } finally {
+                    try { encoder.close(); } catch { /* already closed */ }
+                    gpu.device.destroy();
+                }
+                const seconds = (performance.now() - started) / 1e3;
+                return { frames: encoded, seconds, fps: encoded / seconds };
+            }
+
+            async function runBench() {
+                const clip = document.getElementById("clip").value;
+                const direction = document.getElementById("direction").value;
+                const capture = document.getElementById("capture").value;
+                const iters = Math.max(1, parseInt(document.getElementById("iters").value, 10) || 3);
+                const acceleration = {
+                    decode: document.getElementById("hwDecode").checked,
+                    encode: document.getElementById("hwEncode").checked,
+                };
+                const encoderLatencyMode = document.getElementById("latency").value;
+                const encoderCodec = document.getElementById("codec").value || null;
+
+                runButton.disabled = true;
+                copyButton.disabled = true;
+                window.__benchResults = null;
+                const file = await fetchSample(clip);
+                const perIteration = [];
+                let lastError = null;
+
+                for (let i = 0; i < iters; i++) {
+                    statusEl.textContent = `iteration ${i + 1}/${iters}…`;
+                    try {
+                        const started = performance.now();
+                        const result = await convertVideoToAnaglyphGpu({
+                            file,
+                            direction,
+                            anaglyphType: "color",
+                            acceleration,
+                            encoderLatencyMode,
+                            encoderCodec,
+                            canvasCapture: capture === "canvas",
+                        });
+                        perIteration.push({
+                            fps: result.report.fps,
+                            seconds: result.report.seconds,
+                            frames: result.report.frames,
+                            sourceWidth: result.report.width,
+                            sourceHeight: result.report.height,
+                            output: result.report.output,
+                            rotation: result.report.rotation,
+                            blender: result.report.blender,
+                            frameCopy: result.report.frameCopy,
+                            capture: result.report.capture,
+                            reversals: result.report.reversals,
+                            encoder: result.report.encoder,
+                            decoder: result.report.decoder,
+                            stageMs: result.stageMs,
+                            outputBytes: result.blob.size,
+                            wallSeconds: (performance.now() - started) / 1e3,
+                        });
+                    } catch (err) {
+                        lastError = String(err && err.message ? err.message : err);
+                        break;
+                    }
+                }
+
+                let decodeOnly = null;
+                let encodeOnly = null;
+                if (!lastError && perIteration.length > 0) {
+                    statusEl.textContent = "decode-only…";
+                    try {
+                        decodeOnly = await benchDecode(file);
+                    } catch (err) {
+                        decodeOnly = { error: String(err && err.message ? err.message : err) };
+                    }
+                    statusEl.textContent = "encode-only…";
+                    try {
+                        const dims = perIteration[0];
+                        encodeOnly = await benchEncode(
+                            file,
+                            capture,
+                            Math.max(120, dims.frames || 180),
+                        );
+                    } catch (err) {
+                        encodeOnly = { error: String(err && err.message ? err.message : err) };
+                    }
+                }
+
+                let gpu = "no adapter";
+                if (navigator.gpu) {
+                    const adapter = await navigator.gpu.requestAdapter().catch(() => null);
+                    if (adapter) {
+                        const info =
+                            adapter.info ??
+                            (await adapter.requestAdapterInfo?.().catch(() => null));
+                        gpu = info
+                            ? `${info.vendor ?? "?"} ${info.architecture ?? ""}`.trim()
+                            : "adapter present";
+                    }
+                }
+
+                window.__benchResults = {
+                    clip,
+                    direction,
+                    capture,
+                    acceleration,
+                    encoderLatencyMode,
+                    encoderCodec,
+                    iters: perIteration,
+                    decodeOnly,
+                    encodeOnly,
+                    error: lastError,
+                    meta: {
+                        userAgent: navigator.userAgent,
+                        webgpu: gpu,
+                        deviceMemory: navigator.deviceMemory ?? null,
+                        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+                    },
+                };
+
+                renderTable(window.__benchResults);
+                statusEl.textContent = lastError ? `Failed: ${lastError}` : "done.";
+                runButton.disabled = false;
+                copyButton.disabled = false;
+            }
+
+            function renderTable(results) {
+                resultsEl.innerHTML = "";
+                resultsEl.style.display = "table";
+                const header = resultsEl.insertRow();
+                for (const title of [
+                    "iter",
+                    "pairs",
+                    "fps",
+                    "submit ms",
+                    "capture ms",
+                    "motion ms",
+                    "enc-wait ms",
+                    "dec-wait ms",
+                    "capture",
+                    "encoder",
+                    "out MB",
+                ]) {
+                    header.appendChild(document.createElement("th")).textContent = title;
+                }
+                results.iters.forEach((run, index) => {
+                    const row = resultsEl.insertRow();
+                    const cell = (value) => (row.insertCell().textContent = value);
+                    cell(String(index + 1));
+                    cell(String(run.frames));
+                    cell(run.fps.toFixed(1));
+                    cell(String(Math.round(run.stageMs.blend)));
+                    cell(String(Math.round(run.stageMs.capture)));
+                    cell(String(Math.round(run.stageMs.motion || 0)));
+                    cell(String(Math.round(run.stageMs.encodeWait)));
+                    cell(String(Math.round(run.stageMs.decodeWait)));
+                    cell(run.capture);
+                    cell(run.encoder);
+                    cell((run.outputBytes / 1e6).toFixed(2));
+                });
+                const summary = resultsEl.insertRow();
+                for (const v of [
+                    "bounds",
+                    results.decodeOnly && !results.decodeOnly.error
+                        ? `dec ${results.decodeOnly.fps.toFixed(0)} fps`
+                        : "dec —",
+                    results.encodeOnly && !results.encodeOnly.error
+                        ? `enc ${results.encodeOnly.fps.toFixed(0)} fps`
+                        : "enc —",
+                ]) {
+                    summary.insertCell().textContent = v;
+                }
+            }
+        </script>
+    </body>
+</html>

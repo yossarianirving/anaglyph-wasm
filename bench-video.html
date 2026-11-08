@@ -116,6 +116,14 @@
                     <button type="submit" class="btn btn-primary" id="run">
                         Run
                     </button>
+                    <button
+                        type="button"
+                        class="btn btn-outline-secondary ms-2"
+                        id="copyJson"
+                        disabled
+                    >
+                        Copy JSON
+                    </button>
                     <span id="status" class="ms-2 text-muted" aria-live="polite"></span>
                 </div>
             </form>
@@ -140,6 +148,20 @@
             const statusEl = document.getElementById("status");
             const resultsEl = document.getElementById("results");
             const jsonEl = document.getElementById("json");
+
+            document
+                .getElementById("copyJson")
+                .addEventListener("click", async () => {
+                    if (!window.__benchResults) return;
+                    const text = JSON.stringify(window.__benchResults, null, 2);
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        statusEl.textContent = "JSON copied to clipboard.";
+                    } catch {
+                        statusEl.textContent =
+                            "Clipboard blocked — select the JSON block below and copy manually.";
+                    }
+                });
 
             /** Collected result of the most recent run (Playwright reads this). */
             window.__benchResults = null;
@@ -380,6 +402,7 @@
                 const runButton = document.getElementById("run");
 
                 runButton.disabled = true;
+                document.getElementById("copyJson").disabled = true;
                 window.__benchResults = null;
                 const file = await fetchSample(clip);
                 const perIteration = [];
@@ -509,6 +532,7 @@
                 };
 
                 renderTable(window.__benchResults);
+                document.getElementById("copyJson").disabled = false;
                 statusEl.textContent = lastError ? `Failed: ${lastError}` : "done.";
                 runButton.disabled = false;
             }
