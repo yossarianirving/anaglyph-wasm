@@ -15,7 +15,7 @@
  * headless=new anyway. --bytes runs the default cases through the
  * copyTextureToBuffer encode path instead of canvas capture.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,30 @@ const CASES = [
       requireStream(output, "codec_type=audio", "codec_name=aac");
     },
   },
+  // Blend-type regression: the eye-matrix uniform must reach the shader
+  // transposed (WGSL columns vs Rust rows). A wrong transpose leaves the
+  // diagonal `color` matrix fine but dumps left-red into green on the
+  // gray types (reported as a heavily green image). Check every type in
+  // ANAGLYPH_MATRICES against the native anaglyph-rs CLI.
+  ...["color", "half-color", "grayscale", "optimized", "true"].map((type) => ({
+    name: `${type} type`,
+    file: sample("booth2s.mp4"),
+    anaglyphType: type,
+    expectAudio: false,
+    check(report, output, file) {
+      requireStream(output, "codec_type=video", "codec_name=h264");
+      // Firefox's VideoEncoder RGB→YUV round trip lifts the green channel
+      // ~34/255 on extreme-chroma pixels (green=0 saturated red-magenta)
+      // and the lift survives its own bt709 tag — measured identical for
+      // the wasm pipeline (bench/probe-fx-greenspill.mjs), so the GPU
+      // pipeline matches the reference within the engine's fidelity. The
+      // `true` type is pure boundary chroma (every pixel green=0), so the
+      // sample-domain PSNR collapses to ~21 dB there; other types keep
+      // enough in-gamut chroma to stay near 40.
+      const floor = browserName === "firefox" && type === "true" ? 18 : 35;
+      requirePsnr(file, nativeGroundTruth(sample("booth2s.mp4"), type), floor, type);
+    },
+  })),
   {
     // Reference from bench/e2e-video.mjs: exactly one reversal, ~5.67s.
     name: "boomerang auto",
@@ -197,6 +221,65 @@ function requireNoStream(probeOutput, needle) {
   if (bad) throw new Error(`ffprobe unexpectedly matched ${needle}`);
 }
 
+const NATIVE = join(
+  root,
+  "..",
+  "anaglyph-rs",
+  "target",
+  "release",
+  "anaglyph-rs",
+);
+const nativeTruthCache = new Map();
+
+/** Convert `clip` (absolute path) with the native CLI (clockwise, given
+ * anaglyph type), cached per (clip, type). Ground truth for pixels. */
+function nativeGroundTruth(clip, anaglyphType) {
+  const key = `${clip}|${anaglyphType}`;
+  if (!nativeTruthCache.has(key)) {
+    const out = `/tmp/opencode/gpu-e2e-native-${anaglyphType}-${clip.split("/").pop()}`;
+    execFileSync(
+      NATIVE,
+      [
+        "--video",
+        clip,
+        "--out",
+        out,
+        "-d",
+        "clockwise",
+        "-t",
+        anaglyphType,
+        "-e",
+        "software",
+        "-b",
+        "cpu",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    nativeTruthCache.set(key, out);
+  }
+  return nativeTruthCache.get(key);
+}
+
+/** ffmpeg PSNR (average dB) between two files; throws if below min. */
+function requirePsnr(fileA, fileB, minDb, label) {
+  const r = spawnSync(
+    "ffmpeg",
+    ["-hide_banner", "-i", fileA, "-i", fileB, "-lavfi", "psnr", "-f", "null", "-"],
+    { encoding: "utf8", maxBuffer: 32 << 20 },
+  );
+  const match = /average:([0-9.]+)/.exec(r.stderr ?? "");
+  if (!match) {
+    throw new Error(`${label}: ffmpeg psnr produced no result (${r.status})`);
+  }
+  const db = parseFloat(match[1]);
+  if (!(db >= minDb)) {
+    throw new Error(
+      `${label}: PSNR ${db} dB vs native below ${minDb} dB floor`,
+    );
+  }
+  console.log(`  psnr(${label}) = ${db.toFixed(2)} dB`);
+}
+
 function fail(message) {
   console.error(`FAIL: ${message}`);
   process.exitCode = 1;
@@ -289,6 +372,9 @@ try {
     if (useBytes) await page.uncheck("#canvasCapture");
     if (testCase.direction) {
       await page.selectOption("#videoDirection", testCase.direction);
+    }
+    if (testCase.anaglyphType) {
+      await page.selectOption("#anaglyphType", testCase.anaglyphType);
     }
     await page.waitForFunction(() => !document.getElementById("submit").disabled);
     await page.click("#submit");
@@ -395,7 +481,7 @@ try {
     execFileSync("ffmpeg", ["-v", "error", "-i", outFile, "-f", "null", "-"]);
     if (testCase.check) {
       try {
-        testCase.check(report, output);
+        testCase.check(report, output, outFile);
       } catch (err) {
         fail(`${testCase.name}: ${err.message}`);
       }

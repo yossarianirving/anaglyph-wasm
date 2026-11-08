@@ -64,9 +64,11 @@ const KEYFRAME_INTERVAL_S = 2;
 class PipelineError extends Error {}
 
 /**
- * Eye matrices from anaglyph-rs `anaglyph.rs`, flattened row-major
- * (`m[inputChannel][outputChannel]` at `inputChannel*3 + outputChannel`) —
- * the upload order the blend shader's mat3x3 columns expect.
+ * Eye matrices from anaglyph-rs `anaglyph.rs`, flat row-major exactly as
+ * Rust stores them: row `c` of an eye holds the coefficients of OUTPUT
+ * channel `c` across the input channels
+ * (`out[c] = dot3(l, m[c*3], m[c*3+1], m[c*3+2])`). See
+ * `packBlendUniform` for the upload transposition this requires.
  */
 export const ANAGLYPH_MATRICES = {
   true: [
@@ -90,6 +92,38 @@ export const ANAGLYPH_MATRICES = {
     0, 0, 0, 0, 1, 0, 0, 0, 1,
   ],
 };
+
+/**
+ * Pack the 128-byte blend uniform: crop vec4 at offset 0, flags vec4
+ * (x = y flip) at 16, then the two eye matrices at 32 and 96.
+ *
+ * WGSL `mat3x3` stores three vec3 columns at 16-byte stride, and
+ * `m * rgb` distributes input channel k across WGSL COLUMN k
+ * (`out[i] = Σ_k rgb[k] * column_k[i]`). The Rust table stores the same
+ * thing in its rows instead — row c holds output channel c's
+ * coefficients — so the columns of the WGSL matrix are the TRANSPOSE of
+ * the Rust table's rows: WGSL column k takes Rust column k, skipping
+ * the vec3 padding slot each 16-byte stride. (The diagonal color matrix
+ * is transpose-invariant, which is why only the gray/optimized/half
+ * types ever show this up.)
+ *
+ * @param {number[]} matrix flat 18 floats from ANAGLYPH_MATRICES
+ * @param {{x0: number, y0: number, w: number, h: number}} crop
+ * @param {0 | 1} yFlip external-texture y flip from the probe
+ * @returns {Float32Array} 32 floats (128 bytes)
+ */
+export function packBlendUniform(matrix, crop, yFlip = 0) {
+  const uf = new Float32Array(32);
+  uf.set([crop.x0, crop.y0, crop.w, crop.h], 0);
+  uf[4] = yFlip;
+  for (let k = 0; k < 3; k++) {
+    for (let i = 0; i < 3; i++) {
+      uf[8 + 4 * k + i] = matrix[i * 3 + k]; // m0 column k = Rust column k
+      uf[20 + 4 * k + i] = matrix[9 + i * 3 + k]; // m1
+    }
+  }
+  return uf;
+}
 
 /** Wait until `codec`'s pending-work queue is at or below `limit`. */
 async function drainQueue(codec, queueSizeProperty, limit) {
@@ -705,26 +739,13 @@ export async function convertVideoToAnaglyphGpu(options) {
         },
         primitive: { topology: "triangle-list" },
       });
-      // BlendU: crop vec4 + flags vec4 (x = y flip) + two mat3x3. WGSL
-      // `mat3x3` stores three vec3 columns at 16-byte stride, and
-      // `m * rgb` computes out[c] = Σ_k rgb[k] * column_c[k] — so Rust's
-      // row c (the output channel c coefficients in combine_slices)
-      // becomes WGSL column c, with the vec3 padding slot skipped.
+      // BlendU: crop vec4 + flags vec4 (x = y flip) + two eye matrices
+      // transposed into WGSL column order (packBlendUniform).
       const blendU = device.createBuffer({
         size: 128,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      const u32 = new ArrayBuffer(128);
-      const uf = new Float32Array(u32);
-      uf.set([crop.x0, crop.y0, crop.w, crop.h], 0);
-      uf[4] = yFlip;
-      for (let k = 0; k < 3; k++) {
-        for (let i = 0; i < 3; i++) {
-          uf[8 + 4 * k + i] = matrix[k * 3 + i]; // m0 column k = Rust row k
-          uf[20 + 4 * k + i] = matrix[9 + k * 3 + i]; // m1
-        }
-      }
-      device.queue.writeBuffer(blendU, 0, u32);
+      device.queue.writeBuffer(blendU, 0, packBlendUniform(matrix, crop, yFlip).buffer);
 
       const targetTex = device.createTexture({
         format: "bgra8unorm",

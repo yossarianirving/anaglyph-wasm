@@ -3,12 +3,12 @@
  *
  * - `makeBlendShader(source)`: fullscreen fragment pass compositing two video
  *   frames into the anaglyph — a direct port of `combine_slices` in
- *   anaglyph-rs `anaglyph.rs`: `out[c] = dot(L, m0[·][c]) +
- *   dot(R, m1[·][c])`, clamped to [0,1]. The eye matrices are uploaded as
- *   uniforms; flat row-major order (`m[k][c]` at `k*3 + c`) maps onto a
- *   WGSL `mat3x3<f32>` such that `m * rgb` produces exactly that out[c]
- *   (WGSL stores columns contiguously, so column k receives Rust row k,
- *   the coefficients of input channel k across output channels).
+ *   anaglyph-rs `anaglyph.rs`: `out[c] = dot(L, m0[c*3..c*3+3]) +
+ *   dot(R, m1[c*3..c*3+3])`, clamped to [0,1]. The eye matrices are
+ *   uploaded as uniforms; the Rust table stores output channel c's
+ *   coefficients in flat row c, while WGSL `m * rgb` distributes input
+ *   channel k across matrix COLUMN k, so the upload transposes
+ *   (`packBlendUniform` in gpu-pipeline.js).
  *   Like the wasm video path there is no per-pair parallax shift — motion
  *   estimation only picks the eye order.
  * - `makeLumaShader(source)`: grayscale of one frame into the R32Float

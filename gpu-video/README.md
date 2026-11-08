@@ -150,6 +150,38 @@ dominated iOS profiling) and zero-CPU pixel movement; Firefox `auto` is
 rate-limited by motion-sample readback latency on the GPU tick and
 would benefit from deeper readback pipelining.
 
+## Follow-up — closing the desktop gap
+
+Ideas parked while the mobile path was the priority (numbers from the
+A/B runs above, 480×270 on this host):
+
+- **Pipeline Chrome's external-mode capture.** The depth-16 capture FIFO
+  (`issuePairPipelined`) only runs in canvas source mode; the external
+  path still waits on each pair's readback gate before issuing the next.
+  Chrome's `mapAsync` is ~2 ms serial (Firefox's is ~100 ms), so the win
+  is smaller but real — the gate wait is pure dead time between blends.
+- **Feed the encoder CPU bytes, not canvas snapshots.** Encode-only
+  ingest is 6429–9545 fps with `new VideoFrame(bytes)` vs ~1543 fps for
+  `new VideoFrame(canvas)` on the same machine. The `--bytes` readback
+  path already produces packed BGRA; using it as the primary encoder
+  feed on desktop (keeping canvas capture where the copy is expensive,
+  e.g. mobile) could lift the GPU path's 467–580 pairs/s substantially.
+- **Stage costs to attack.** Per pair the wasm path pays ~0.063 ms copy
+  + ~0.47 ms blend before an encoder feed that never stalls below
+  ~6400 fps; the GPU path pays a ~1.58 ms GPU→encoder crossing per pair.
+  That crossing, not GPU compute, is the gap — batching VideoFrames
+  through it (ring of pre-created frames, encoder-side queueing) is the
+  lever.
+- **Resolution crossover.** The per-pair crossing cost is roughly fixed
+  while the wasm copy+blend scales with pixels; at 1080p the wasm CPU
+  path drops toward the GPU path's rate and the GPU path overtakes it
+  (measured directionally; worth pinning with `run-web-bench.mjs` at
+  1080p before claiming a number).
+- **Firefox `auto` direction tracking.** 82–111 pairs/s is rate-limited
+  by motion-sample readback latency on the GPU tick; batching those
+  readbacks the way pair captures are batched should bring `auto` in
+  line with `clockwise` (238–308 pairs/s).
+
 ## Validation
 
 - `node gpu-video/validate-shaders.mjs` — every WGSL source type-checked
@@ -157,14 +189,23 @@ would benefit from deeper readback pipelining.
   substituted) + workgroup limits.
 - `node --test gpu-video/ js/` — tracker port vs the Rust test suite,
   pairing integration through the real `AutoFramePairer`, motion
-  geometry + aggregation gates vs `motion.rs`.
-- `node bench/e2e-gpu.mjs [--browser=chrome|firefox] [--bytes]` — 11-case
-  browser suite (silent/HW, aac + opus stream-copy, boomerang auto with
+  geometry + aggregation gates vs `motion.rs`, and `blend-uniform.test.mjs`
+  (eye-matrix uniform bytes → WGSL `mat3x3` product vs `combine_slices`
+  for all five anaglyph types — guards the transposition that made
+  non-`color` types render heavily green).
+- `node bench/e2e-gpu.mjs [--browser=chrome|firefox] [--bytes]` — 16-case
+  browser suite (silent/HW, aac + opus stream-copy, one case per anaglyph
+  type checked against the native anaglyph-rs CLI, boomerang auto with
   reversal-time check, odd dims, rotation, software decode, one-frame
   and corrupt-upload errors, cancel-then-recover). Outputs are PSNR'd
   against the native CLI ground truth: silent 41.6–42.3 dB, auto 41.0–
   41.3 dB, aac 41.2–41.8 dB — encoder-noise level, verified on Chrome
-  and Firefox.
+  and Firefox. Blend types land at 40.8–44.6 dB on Chrome; on Firefox
+  the `true` type floors at 18 dB because the engine's own RGB→YUV
+  encoder path lifts the green channel ~34/255 on boundary-chroma
+  pixels (green=0) — `bench/probe-fx-greenspill.mjs` measures the same
+  lift through the wasm pipeline, so the GPU pipeline matches the
+  reference within the engine's fidelity.
 
 Known unknowns on device (all spec-supported, but engine-dependent):
 `new VideoFrame(OffscreenCanvas)` capture semantics on Safari (falls back
