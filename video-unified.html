@@ -56,15 +56,15 @@
                             >Video Direction:</label
                         >
                         <select class="form-select" id="videoDirection">
+                            <option value="auto-reverse" selected>
+                                Auto (close shot)
+                            </option>
+                            <option value="auto">
+                                Auto (wide shot)
+                            </option>
                             <option value="clockwise">Clockwise</option>
                             <option value="counter-clockwise">
                                 Counter-Clockwise
-                            </option>
-                            <option value="auto">
-                                Auto (detect from motion)
-                            </option>
-                            <option value="auto-reverse" selected>
-                                Auto, swapped eyes
                             </option>
                         </select>
                     </div>
@@ -175,10 +175,10 @@
                             id="encoderQuality"
                             style="max-width: 14rem"
                         >
-                            <option value="standard" selected>
+                            <option value="standard">
                                 Standard
                             </option>
-                            <option value="high">High</option>
+                            <option value="high" selected>High</option>
                             <option value="maximum">Maximum</option>
                         </select>
                         <div class="form-text">
@@ -190,7 +190,7 @@
                         </div>
                     </div>
                 </div>
-
+                <br>
                 <button
                     type="submit"
                     class="btn btn-primary"
