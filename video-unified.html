@@ -241,28 +241,16 @@
         </main>
         <script type="module">
             /**
-             * One page, both pipelines. The two workers speak the identical
-             * message protocol (convert-video / cancel-video /
-             * video-progress / video-result / video-cancelled /
-             * anaglyph-error), so this page only swaps which script it boots
-             * and passes the union of their options — each worker reads the
-             * fields it understands and ignores the rest.
+             * One page, both pipelines — a thin UI over the package entry:
+             * index.js owns the engine selection, the worker lifecycle
+             * (ready-handshake queue, cancel watchdog) and the WebGPU→wasm
+             * fallback; this page only wires controls, progress and results.
              */
-            var WORKER_URLS = {
-                wasm: "video-worker.js",
-                webgpu: "gpu-video/gpu-worker.js",
-            };
+            import { checkSupport, createVideoConverter } from "./index.js";
 
-            var engine = "webgpu";
-            var webgpuAvailable = false;
-            var worker = null;
-            var workerReady = false;
-            var pendingJob = null;
+            var engine = "webgpu"; // engine the next run will use
             var pickedFile = null;
             var objectUrl = null;
-            var cancelWatchdog = null;
-            var lastJob = null;
-            var fellBackOnce = false;
 
             var submit = document.getElementById("submit");
             var cancel = document.getElementById("cancel");
@@ -294,120 +282,29 @@
             }
 
             engineSelect.addEventListener("change", function () {
-                setEngine(engineSelect.value);
+                engine = engineSelect.value;
+                syncEngineControls();
             });
 
-            function setEngine(next, note) {
-                if (next === engine && worker) return;
-                engine = next;
-                engineSelect.value = next;
-                syncEngineControls();
-                recreateWorker();
-                if (note) setStatus(note);
-            }
+            // --- conversion (worker lifecycle lives in index.js) ---
 
-            // --- worker lifecycle (protocol shared by both pipelines) ---
-
-            /**
-             * Tear down and rebuild the worker for the current engine. The
-             * last-resort recovery for a conversion that refused to die:
-             * WebCodecs teardown differs per engine, and a worker stuck
-             * awaiting a never-settling codec promise would otherwise hold
-             * the busy guard forever. Terminating is the one operation no
-             * engine can ignore.
-             */
-            function recreateWorker() {
-                if (worker) worker.terminate();
-                workerReady = false;
-                pendingJob = null;
-                worker = new Worker(WORKER_URLS[engine], { type: "module" });
-                worker.onmessage = function (e) {
-                    switch (e.data.type) {
-                        case "ready":
-                            workerReady = true;
-                            if (pendingJob) {
-                                var job = pendingJob;
-                                pendingJob = null;
-                                worker.postMessage(job);
-                            }
-                            break;
-                        case "video-progress":
-                            clearWatchdog();
-                            setProgress(e.data);
-                            break;
-                        case "video-result":
-                            clearWatchdog();
-                            showResult(e.data.url, e.data.report);
-                            setBusy(false);
-                            break;
-                        case "video-cancelled":
-                            clearWatchdog();
-                            setStatus("Cancelled.");
-                            setBusy(false);
-                            break;
-                        case "anaglyph-error":
-                            clearWatchdog();
-                            onRunFailed(e.data.message);
-                            break;
-                        default:
-                            break;
+            var converter = createVideoConverter({
+                onEngine: function (which, note) {
+                    if (note && note.fallback) {
+                        // The webgpu run died for adapter reasons and
+                        // index.js is retrying on wasm — flip the control
+                        // to match.
+                        engine = which;
+                        engineSelect.value = which;
+                        syncEngineControls();
+                        setStatus(
+                            "WebGPU run failed (" +
+                                note.fallback +
+                                ") — retrying on the wasm pipeline…",
+                        );
                     }
-                };
-                // A worker that dies outside the message protocol (uncaught
-                // exception) would otherwise leave the page busy forever.
-                worker.onerror = function (e) {
-                    clearWatchdog();
-                    onRunFailed(
-                        "worker error" + (e.message ? " — " + e.message : ""),
-                    );
-                };
-            }
-
-            /**
-             * The wasm worker boots asynchronously (wasm-bindgen init); the
-             * GPU worker replies immediately. Either way, queue a job
-             * submitted before the worker announced itself instead of racing
-             * its init — this matters for the WebGPU→wasm fallback, which
-             * posts a job seconds after spawning the worker.
-             */
-            function postJob(job) {
-                if (workerReady) worker.postMessage(job);
-                else pendingJob = job;
-            }
-
-            /**
-             * A run that failed for lack of WebGPU (adapter vanished after
-             * the page-load probe, e.g. the GPU got reclaimed) is retried
-             * once on the wasm pipeline, flipping the engine control to
-             * match. Anything else is a normal failure.
-             */
-            function onRunFailed(message) {
-                if (
-                    engine === "webgpu" &&
-                    !fellBackOnce &&
-                    lastJob &&
-                    /webgpu|gpu adapter/i.test(message)
-                ) {
-                    fellBackOnce = true;
-                    setEngine("wasm");
-                    setStatus(
-                        "WebGPU run failed (" +
-                            message +
-                            ") — retrying on the wasm pipeline…",
-                    );
-                    postJob(lastJob);
-                    return;
-                }
-                setStatus("Failed: " + message);
-                setBusy(false);
-            }
-
-            function clearWatchdog() {
-                if (cancelWatchdog) {
-                    clearTimeout(cancelWatchdog);
-                    cancelWatchdog = null;
-                }
-            }
+                },
+            });
 
             function setStatus(text) {
                 statusEl.textContent = text;
@@ -441,7 +338,7 @@
                 );
             }
 
-            function showResult(url, report) {
+            function showResult(url, report, usedEngine) {
                 if (objectUrl) URL.revokeObjectURL(objectUrl);
                 objectUrl = url;
                 var video = document.getElementById("resultVideo");
@@ -463,7 +360,11 @@
                               : String(value);
                 }
                 document.getElementById("result").style.display = "block";
-                setStatus("Done. (" + (engine === "webgpu" ? "WebGPU pipeline" : "wasm pipeline") + ")");
+                setStatus(
+                    "Done. (" +
+                        (usedEngine === "webgpu" ? "WebGPU pipeline" : "wasm pipeline") +
+                        ")",
+                );
             }
 
             function setFile(file) {
@@ -509,50 +410,51 @@
                     progressWrap.style.display = "block";
                     progressBar.style.width = "0%";
                     setStatus("Starting… (" + (engine === "webgpu" ? "WebGPU" : "wasm") + ")");
-                    lastJob = {
-                        type: "convert-video",
-                        file: pickedFile,
-                        direction: document.getElementById("videoDirection").value,
-                        anaglyphType: document.getElementById("anaglyphType").value,
-                        acceleration: {
-                            decode: document.getElementById("hwDecode").checked,
-                            encode: document.getElementById("hwEncode").checked,
-                            webgpu: document.getElementById("webgpuBlend").checked,
-                        },
-                        canvasCapture: document.getElementById("canvasCapture").checked,
-                        encoderQuality: document.getElementById("encoderQuality").value,
-                    };
-                    fellBackOnce = false;
-                    postJob(lastJob);
+                    converter
+                        .convert(
+                            {
+                                file: pickedFile,
+                                direction: document.getElementById("videoDirection").value,
+                                anaglyphType: document.getElementById("anaglyphType").value,
+                                acceleration: {
+                                    decode: document.getElementById("hwDecode").checked,
+                                    encode: document.getElementById("hwEncode").checked,
+                                    webgpu: document.getElementById("webgpuBlend").checked,
+                                },
+                                canvasCapture: document.getElementById("canvasCapture").checked,
+                                encoderQuality: document.getElementById("encoderQuality").value,
+                                onProgress: setProgress,
+                            },
+                            { engine: engine },
+                        )
+                        .then(function (res) {
+                            showResult(res.url, res.report, res.engine);
+                        })
+                        .catch(function (err) {
+                            if (err && err.name === "AbortError") {
+                                setStatus(
+                                    err.workerReset
+                                        ? "Cancelled. The stuck worker was reset" +
+                                              (pickedFile
+                                                  ? "; pick \u201c" + pickedFile.name + "\u201d again"
+                                                  : "") +
+                                              "."
+                                        : "Cancelled.",
+                                );
+                            } else {
+                                setStatus(
+                                    "Failed: " + (err && err.message ? err.message : err),
+                                );
+                            }
+                        })
+                        .then(function () {
+                            setBusy(false);
+                        });
                 });
 
             cancel.addEventListener("click", function () {
-                if (pendingJob) {
-                    // Never reached the worker (still waiting for its ready
-                    // handshake) — just drop it.
-                    pendingJob = null;
-                    setStatus("Cancelled.");
-                    setBusy(false);
-                    return;
-                }
                 setStatus("Cancelling…");
-                worker.postMessage({ type: "cancel-video" });
-                // Grace period for the cooperative cancel (the pipeline
-                // aborts its awaits, the worker replies). Some engines can
-                // strand a codec await past the abort; if no reply arrives,
-                // force-reset the worker so the page never stays busy.
-                clearWatchdog();
-                var name = pickedFile && pickedFile.name;
-                cancelWatchdog = setTimeout(function () {
-                    cancelWatchdog = null;
-                    recreateWorker();
-                    setStatus(
-                        "Cancelled. The stuck worker was reset" +
-                            (name ? "; pick \u201c" + name + "\u201d again" : "") +
-                            ".",
-                    );
-                    setBusy(false);
-                }, 1500);
+                converter.cancel();
             });
 
             // Capability banner + engine default: WebCodecs is required by
@@ -560,44 +462,28 @@
             // adapter (or ?engine=wasm) → start on the wasm pipeline with the
             // toggle already flipped.
             (async function () {
+                var support = await checkSupport();
                 var lines = [];
-                var hasCodecs =
-                    typeof VideoDecoder !== "undefined" &&
-                    typeof VideoEncoder !== "undefined";
                 lines.push(
-                    "WebCodecs: " + (hasCodecs ? "supported" : "NOT supported — video conversion needs a browser with WebCodecs (Chrome/Edge 94+, Firefox 130+, Safari 26+)"),
+                    "WebCodecs: " + (support.webcodecs ? "supported" : "NOT supported — video conversion needs a browser with WebCodecs (Chrome/Edge 94+, Firefox 130+, Safari 26+)"),
                 );
-                if (hasCodecs) {
-                    var avc = await VideoEncoder.isConfigSupported({
-                        codec: "avc1.640028",
-                        width: 1920,
-                        height: 1080,
-                    }).catch(function () {
-                        return { supported: false };
-                    });
+                if (support.webcodecs) {
                     lines.push(
-                        "H.264 encode: " + (avc.supported ? "supported" : "not available (WebM fallback will be used)"),
+                        "H.264 encode: " + (support.h264Encode ? "supported" : "not available (WebM fallback will be used)"),
                     );
                 }
-                if (navigator.gpu) {
-                    var adapter = await navigator.gpu.requestAdapter().catch(function () {
-                        return null;
-                    });
-                    webgpuAvailable = !!adapter;
-                }
                 lines.push(
-                    "WebGPU: " + (webgpuAvailable ? "adapter available" : "not available"),
+                    "WebGPU: " + (support.webgpu ? "adapter available" : "not available"),
                 );
 
                 engine =
-                    new URLSearchParams(location.search).get("engine") === "wasm"
+                    new URLSearchParams(location.search).get("engine") === "wasm" ||
+                    !support.webgpu
                         ? "wasm"
-                        : webgpuAvailable
-                          ? "webgpu"
-                          : "wasm";
+                        : "webgpu";
                 engineSelect.value = engine;
                 var webgpuOption = engineSelect.querySelector('option[value="webgpu"]');
-                if (!webgpuAvailable) {
+                if (!support.webgpu) {
                     webgpuOption.textContent = "WebGPU (all-GPU, no wasm) — not available here";
                     document.getElementById("engineNote").textContent =
                         "No WebGPU adapter in this browser: the page starts on the wasm pipeline.";
@@ -605,9 +491,8 @@
                 var caps = document.getElementById("caps");
                 caps.textContent = lines.join("  · ");
                 caps.className =
-                    "alert py-2 " + (hasCodecs ? "alert-secondary" : "alert-warning");
+                    "alert py-2 " + (support.webcodecs ? "alert-secondary" : "alert-warning");
                 syncEngineControls();
-                recreateWorker();
             })();
         </script>
     </body>

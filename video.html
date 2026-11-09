@@ -196,7 +196,7 @@
             </div>
         </main>
         <script type="module">
-            var worker = new Worker("video-worker.js", { type: "module" });
+            var worker = new Worker("workers/video-worker.js", { type: "module" });
             var pickedFile = null;
             var objectUrl = null;
             var cancelWatchdog = null;
@@ -217,7 +217,7 @@
              */
             function recreateWorker() {
                 if (worker) worker.terminate();
-                worker = new Worker("video-worker.js", { type: "module" });
+                worker = new Worker("workers/video-worker.js", { type: "module" });
             }
 
             worker.onmessage = function (e) {

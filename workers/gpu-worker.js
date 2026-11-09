@@ -7,7 +7,7 @@
 import {
   convertVideoToAnaglyphGpu,
   createGpuContext,
-} from "./gpu-pipeline.js";
+} from "../gpu-video/gpu-pipeline.js";
 
 /** @type {AbortController | null} */
 let controller = null;
@@ -51,8 +51,14 @@ async function startConversion(data) {
       onProgress: (status) => postMessage({ type: "video-progress", ...status }),
       signal: controller.signal,
     });
-    const url = URL.createObjectURL(blob);
-    postMessage({ type: "video-result", url: url, report: report });
+    // `url` serves the plain-page consumers; `blob` (structured-clone moves
+    // the handle, not the bytes) serves the library API in index.js.
+    postMessage({
+      type: "video-result",
+      url: URL.createObjectURL(blob),
+      blob: blob,
+      report: report,
+    });
   } catch (err) {
     const message = String(err && err.message ? err.message : err);
     postMessage({

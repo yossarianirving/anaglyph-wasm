@@ -8,13 +8,11 @@
         "build:wasm": "cargo build --target wasm32-unknown-unknown --release --features gpu --lib && wasm-bindgen target/wasm32-unknown-unknown/release/anaglyph_wasm.wasm --out-dir pkg --target web",
         "build:wasm:scalar": "RUSTFLAGS=\"-C target-cpu=mvp -C target-feature=+reference-types\" cargo build --target wasm32-unknown-unknown --release --features gpu --lib && wasm-bindgen target/wasm32-unknown-unknown/release/anaglyph_wasm.wasm --out-dir pkg --target web",
         "serve": "python3 -m http.server 8000",
-        "test": "node --test js/",
+        "test": "node --test js/ gpu-video/",
         "vendor": "cp node_modules/mediabunny/dist/bundles/mediabunny.min.mjs vendor/mediabunny.mjs && cp node_modules/mediabunny/dist/mediabunny.d.ts vendor/mediabunny.d.ts"
     },
-    "dependencies": {
-        "mediabunny": "^1.65.2"
-    },
     "devDependencies": {
+        "mediabunny": "^1.65.2",
         "playwright": "1.65"
     }
 }

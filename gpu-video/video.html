@@ -185,7 +185,7 @@
             </div>
         </main>
         <script type="module">
-            var worker = new Worker("gpu-worker.js", { type: "module" });
+            var worker = new Worker("../workers/gpu-worker.js", { type: "module" });
             var pickedFile = null;
             var objectUrl = null;
             var cancelWatchdog = null;
@@ -203,7 +203,7 @@
              */
             function recreateWorker() {
                 if (worker) worker.terminate();
-                worker = new Worker("gpu-worker.js", { type: "module" });
+                worker = new Worker("../workers/gpu-worker.js", { type: "module" });
             }
 
             worker.onmessage = function (e) {

@@ -8,6 +8,11 @@
   used for editor and `tsc --checkJs` support).
 - Why vendored: the app is bundler-free; a pinned local copy keeps runs
   reproducible and offline-capable (same reasoning as the committed `pkg/`).
+  It is also what makes the library importable as-is: browsers do NOT apply
+  page import maps inside module workers, so a bare `"mediabunny"` specifier
+  only resolves on the main thread — while every conversion actually runs in
+  a worker. The library modules therefore import this file by relative path,
+  and `vendor/` ships as a runtime part of the package.
 
 Upgrade:
 
