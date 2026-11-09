@@ -59,6 +59,9 @@ const HEADED = process.argv.includes("--headed");
 const SKIP_NATIVE = process.argv.includes("--skip-native");
 const BROWSER = argValue("--browser", "chromium");
 const LATENCY = argValue("--latency", "quality");
+// Encoder output-quality tier ("standard" | "high" | "maximum"); see
+// js/encoder-plan.js. Applied to every web run.
+const QUALITY = argValue("--quality", "standard");
 // Restrict every run to one codec family ("avc" | "vp9" | "vp8" | "av1").
 const CODEC = argValue("--codec", null);
 // `--hw off` disables hardware decode AND encode preferences.
@@ -257,6 +260,7 @@ try {
       iters: String(ITERS),
       autorun: "1",
       latency: LATENCY,
+      ...(QUALITY !== "standard" ? { quality: QUALITY } : {}),
       ...(GPU_PAGE ? { capture: run.capture } : {}),
       ...(CODEC ? { codec: CODEC } : {}),
       ...(HW === "off" ? { hwDecode: "0", hwEncode: "0" } : {}),
@@ -302,6 +306,7 @@ try {
     iters: ITERS,
     browser: BROWSER,
     latency: LATENCY,
+    quality: QUALITY,
     hw: HW,
     headless: !(WITH_GPU || HEADED),
     webMeta: web[0]?.meta ?? null,

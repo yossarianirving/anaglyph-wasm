@@ -111,6 +111,16 @@
                             <option value="av1">av1</option>
                         </select>
                     </div>
+                    <div class="form-check form-check-inline">
+                        <label class="form-check-label me-1" for="quality"
+                            >quality</label
+                        >
+                        <select class="form-select form-select-sm d-inline-block w-auto" id="quality">
+                            <option value="standard">standard</option>
+                            <option value="high">high</option>
+                            <option value="maximum">maximum</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="col-12 mt-2">
                     <button type="submit" class="btn btn-primary" id="run">
@@ -137,7 +147,8 @@
         </main>
         <script type="module">
             import init, { MotionAnalyzer, Tracker, VideoBlender, YuvFrameConverter } from "./pkg/anaglyph_wasm.js";
-            import { convertVideoToAnaglyph, planEncoder } from "./js/video-pipeline.js";
+            import { convertVideoToAnaglyph } from "./js/video-pipeline.js";
+            import { planEncoder } from "./js/encoder-plan.js";
             import {
                 ALL_FORMATS,
                 BlobSource,
@@ -171,9 +182,21 @@
             // Auto-start support for the automation harness:
             //   bench-video.html?clip=bench/booth2s.mp4&iters=3&backend=cpu&autorun=1
             // Optional: &hwDecode=0&hwEncode=0&latency=realtime
+            // The clip picker is a <select>: append URL clips that are not
+            // among the presets, or `.value =` silently lands on "".
+            function setClip(value) {
+                const select = document.getElementById("clip");
+                if (![...select.options].some((o) => o.value === value)) {
+                    const option = document.createElement("option");
+                    option.value = value;
+                    option.textContent = value.split("/").pop();
+                    select.appendChild(option);
+                }
+                select.value = value;
+            }
             const params = new URLSearchParams(location.search);
             if (params.get("autorun")) {
-                if (params.get("clip")) document.getElementById("clip").value = params.get("clip");
+                if (params.get("clip")) setClip(params.get("clip"));
                 if (params.get("direction")) document.getElementById("direction").value = params.get("direction");
                 if (params.get("backend")) document.getElementById("backend").value = params.get("backend");
                 if (params.get("iters")) document.getElementById("iters").value = params.get("iters");
@@ -181,6 +204,7 @@
                 if (params.get("hwEncode")) document.getElementById("hwEncode").checked = params.get("hwEncode") !== "0";
                 if (params.get("latency")) document.getElementById("latency").value = params.get("latency");
                 if (params.get("codec")) document.getElementById("codec").value = params.get("codec");
+                if (params.get("quality")) document.getElementById("quality").value = params.get("quality");
                 runBenchmark();
             }
 
@@ -293,7 +317,7 @@
              * Firefox runs its H.264 encoder in a GMP process and some per-
              * frame cost there never shows up in the other stage timings.
              */
-            async function benchEncode({ width, height, frameRate, acceleration, encoderLatencyMode, encoderCodec }, frames) {
+            async function benchEncode({ width, height, frameRate, acceleration, encoderLatencyMode, encoderCodec, encoderQuality }, frames) {
                 const plan = await planEncoder(
                     width,
                     height,
@@ -301,6 +325,7 @@
                     acceleration.encode,
                     encoderLatencyMode,
                     encoderCodec,
+                    encoderQuality,
                 );
                 if (!plan) return null;
                 const data = new Uint8Array(width * height * 4);
@@ -399,6 +424,7 @@
                 };
                 const encoderLatencyMode = document.getElementById("latency").value;
                 const encoderCodec = document.getElementById("codec").value || null;
+                const encoderQuality = document.getElementById("quality").value;
                 const runButton = document.getElementById("run");
 
                 runButton.disabled = true;
@@ -419,6 +445,7 @@
                             acceleration,
                             encoderLatencyMode,
                             encoderCodec,
+                            encoderQuality,
                             createBlender: makeCreateBlender(backend),
                             createYuvConverter: (planeBytes, width, height) => {
                                 const c = new YuvFrameConverter(planeBytes, width, height);
@@ -452,6 +479,7 @@
                             outputBytes: result.blob.size,
                             wallSeconds: (performance.now() - started) / 1e3,
                         });
+                        window.__lastOutput = result.blob;
                     } catch (err) {
                         lastError = String(err && err.message ? err.message : err);
                         break;
@@ -462,7 +490,10 @@
                 let blendOnly = null;
                 let encodeOnly = null;
                 let motionOnly = null;
-                if (!lastError && perIteration.length > 0) {
+                // stages=0 skips the per-stage probes (fast end-to-end only
+                // runs, e.g. bench/quality-sweep.mjs).
+                const runStages = params.get("stages") !== "0";
+                if (!lastError && perIteration.length > 0 && runStages) {
                     statusEl.textContent = "decode-only…";
                     decodeOnly = await benchDecode(file);
                     statusEl.textContent = "blend-only…";
@@ -483,6 +514,7 @@
                                 acceleration,
                                 encoderLatencyMode,
                                 encoderCodec,
+                                encoderQuality,
                             },
                             Math.max(120, dims.frames || 180),
                         );

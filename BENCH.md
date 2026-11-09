@@ -21,8 +21,10 @@ node bench/run-web-bench.mjs --browser firefox --latency realtime --hw off
   apples-to-apples cross-browser runs.
 - `--codec avc|vp9|vp8|av1` pins every run's encoder preference order to one
   family; `--latency quality|realtime` sets the encoder latency mode;
-  `--hw off` disables both hardware codec preferences. All three are also
-  selectable in `bench-video.html`.
+  `--hw off` disables both hardware codec preferences;
+  `--quality standard|high|maximum` sets the output bitrate tier for every
+  web run (see *Encode quality tiers* below). All four are also selectable
+  in `bench-video.html`.
 - Results land in `bench/results/web-<timestamp>.json` (raw, per-iteration)
   and `bench/results/latest.md` (summary table). `bench/results/` is
   git-ignored: numbers are machine-specific by nature.
@@ -235,6 +237,72 @@ the pipeline has no CPU frame copy by construction. Diff as usual with
   the wasm pipeline is copy-bound, and near-zero on a machine whose encoder
   is the bottleneck (Firefox-style encode-bound runs).
 
+## Encode quality tiers (`--quality`)
+
+WebCodecs exposes no QP/CRF surface for file encoding — the portable quality
+lever is the encoder's target bitrate. `js/encoder-plan.js` is the shared
+planner for **both** pipelines, and the `encoderQuality` option — a Standard/
+High/Maximum picker in `video.html` and `gpu-video/video.html`, `?quality=`
+on both bench pages, `--quality` on the runner — scales it on a
+bits-per-pixel-per-frame ladder with per-tier clamps:
+
+| tier       | bpp  | clamp         | 480×270@30 | 720p@30 | 1080p@30 |
+| ---------- | ---- | ------------- | ---------- | ------- | -------- |
+| standard   | 0.10 | 1.5–12 Mbps   | 1.5 Mbps   | 2.8     | 12       |
+| high       | 0.25 | 3–24 Mbps     | 3 Mbps     | 6.9     | 15.6     |
+| maximum    | 0.50 | 6–48 Mbps     | 6 Mbps     | 13.8    | 31       |
+
+`standard` reproduces the original sizing exactly. If every codec candidate
+rejects the high-bitrate config (vendor rate caps), the planner walks the
+tier ladder down before failing, and the report shows the degrade as
+`quality=maximum→high (encoder cap)`.
+
+The motivation is already-compressed, blocky sources: at 0.1 bpp the encoder
+re-quantizes the source's blocks harder than the source itself, so the
+output can look *worse* than the input. Reproduce with
+`node bench/quality-sweep.mjs --browser chrome|firefox --page both --hw both`
+(matrix: pipeline × quality × hw-encode; PSNR/SSIM against the native
+anaglyph-rs software encode — the reference carries its own encode noise, so
+read tier **deltas**, not absolute dB).
+
+Measured 2026-11-09 (Chrome 151 + Firefox, RADV desktop host, clockwise):
+
+| engine / pipeline     | clip        | achieved Mbps          | PSNR dB              | output MB          |
+| --------------------- | ----------- | ---------------------- | -------------------- | ------------------ |
+| Chrome / both         | boomerang   | 1.5 → 2.4 → 2.4        | 42.9 → 42.9 → 42.9   | 2.1 → 3.4 → 3.4    |
+| Firefox / both        | boomerang   | 1.5 → 2.7 → 2.7        | 41.6 → 41.5 → 41.5   | 2.1 → 3.8 → 3.9    |
+| Chrome / gpu          | detail-720p | 2.8 → 6.8 → 9.9        | 39.0 → 39.8 → 39.8   | 2.1 → 5.1 → 7.4    |
+| Chrome / wasm         | detail-720p | 2.8 → 6.8 → 10.8       | 41.4 → 43.2 → 43.2   | 2.1 → 5.1 → 8.0    |
+| Firefox / both        | detail-720p | 2.8 → 6.7 → 9.2        | 19.1 → 19.1 → 19.1   | 2.1 → 5.0 → 6.9    |
+
+(`detail-720p.mp4` is a synthetic 720p clip pre-compressed at crf 30 —
+deliberately blocky and detail-rich; boomerang is calm real 480×270 video.)
+
+- **Calm 480p content is encoder-saturated at standard**: `high` and
+  `maximum` produce byte-identical bitstreams (the VBR encoder cannot spend
+  its 6 Mbps target), and PSNR cannot move against the reference's own
+  noise. No reason to leave `standard` there.
+- **Blocky 720p content separates the tiers**: `standard → high` buys
+  +0.8 dB (gpu) to +1.8 dB (wasm, SSIM 0.9915 → 0.9946) for ~2.5× the
+  bytes; `high → maximum` buys ~0 dB for another 1.4–1.6×. **High is the
+  sweet spot** for blocky sources; Maximum only matters on content with
+  more entropy than either encoder target.
+- **Throughput**: free on Chrome (encoder is not the bottleneck at 480p and
+  the rate-control loop costs little at 720p). Firefox pays ~20% at
+  high/maximum — its software H.264 encoder is the pipeline bottleneck, so
+  its rate control sits directly on the critical path.
+- **hw encode on/off produced identical bitstreams on this host** (the RADV
+  stack exposes no H.264 encode path, so both hints land on the same
+  software encoder). The tiers apply equally to hardware encoders, which
+  typically *benefit more* — their rate control has less
+  rate-distortion cleverness than x264/libvpx at equal bitrate.
+- The degrade ladder never fired on either engine; every engine accepted
+  all three tiers (`isConfigSupported` is the gate).
+- Firefox 720p PSNR sits at ~19 dB at every tier because its RGB→YUV
+  round trip adds a constant green lift that dominates MSE (same effect the
+  e2e suite floors at 18 dB); SSIM and the file sizes show the bitrate
+  lever reaching the encoder correctly.
+
 ## Engine notes (WebKit / Safari / iOS)
 
 Verified against WebKitGTK 2.54.2 (GNOME Web, driven by
@@ -289,6 +357,7 @@ page can never stay busy until reload. `bench/e2e-video.mjs` (Chromium) and
 | `bench/booth2s-vp9.webm` | booth2s re-encoded VP9 (`-b:v 1200k`) | Firefox-safe set |
 | `bench/boomerang-vp9.webm` | boomerang re-encoded VP9 | Firefox-safe set |
 | `bench/long-boomerang.mp4` | 5× concat, ~1700 frames | cancellation e2e |
+| `bench/detail-720p.mp4` | testsrc2 1280x720@30 6 s, pre-compressed `libx264 -crf 30` | encoder-quality sweeps: blocky + detail-rich so the bitrate tiers separate (calm clips saturate) |
 
 Regenerate the derived clips with the ffmpeg lines in
 [the e2e header](bench/e2e-video.mjs) if the base clip changes.

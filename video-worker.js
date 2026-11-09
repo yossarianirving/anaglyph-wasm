@@ -39,6 +39,7 @@ async function startConversion(data) {
       direction: data.direction,
       anaglyphType: data.anaglyphType,
       acceleration: data.acceleration,
+      encoderQuality: data.encoderQuality,
       // wasm-bindgen static async factory (async ctors are deprecated).
       // `backend` is "cpu" when the WebGPU blend toggle is off.
       createBlender: (width, height, anaglyphType, backend) =>

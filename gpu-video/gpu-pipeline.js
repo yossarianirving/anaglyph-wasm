@@ -44,11 +44,10 @@ import {
   EncodedPacketSink,
   EncodedVideoPacketSource,
   Input,
-  Mp4OutputFormat,
   Output,
-  WebMOutputFormat,
 } from "../vendor/mediabunny.mjs";
 import { createPairStrategy } from "../js/pairing.js";
+import { accelLabel, planEncoder, qualityLabel } from "../js/encoder-plan.js";
 import { DirectionTracker } from "./tracker.js";
 import { makeBlendShader, BLIT_SHADER } from "./shaders.js";
 import { makeImporter, probeExternalOrientation, supportsExternalImport } from "./external.js";
@@ -144,25 +143,6 @@ async function drainQueue(codec, queueSizeProperty, limit) {
   }
 }
 
-/**
- * Pick an H.264 High-profile level code that covers the frame size and rate.
- * Deliberately conservative: an over-generous level is always valid.
- */
-function pickAvcLevel(width, height, frameRate) {
-  const pixels = width * height;
-  if (pixels <= 1280 * 720) return 0x29; // 4.1
-  if (pixels <= 1920 * 1080) return frameRate > 30 ? 0x2a : 0x28; // 4.2 / 4.0
-  if (pixels <= 2560 * 1440) return 0x33; // 5.1
-  return 0x34; // 5.2
-}
-
-/** Rough target bitrate: mid-quality VBR, clamped for tiny and huge frames. */
-function targetBitrate(width, height, frameRate) {
-  return Math.round(
-    Math.min(12_000_000, Math.max(1_500_000, width * height * frameRate * 0.1)),
-  );
-}
-
 /** Read the metadata + per-track config the pipeline needs up front. */
 async function inspectSource(file) {
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
@@ -199,95 +179,6 @@ async function inspectSource(file) {
     frameRate,
     duration,
   };
-}
-
-/**
- * Choose the output encoder: try H.264 (MP4) first, then VP9, VP8 and AV1
- * (WebM); within each codec the hardware preference order comes from
- * `hwEncode`. Mirrors `js/video-pipeline.js`; see the notes there.
- */
-async function planEncoder(width, height, frameRate, hwEncode, latencyMode, codecHint) {
-  if (typeof VideoEncoder === "undefined") return null;
-
-  const level = pickAvcLevel(width, height, frameRate)
-    .toString(16)
-    .padStart(2, "0");
-  let codecs = [
-    {
-      container: "mp4",
-      format: () => new Mp4OutputFormat({ fastStart: "in-memory" }),
-      mimeType: "video/mp4",
-      videoSourceCodec: "avc",
-      codec: `avc1.6400${level}`,
-      extra: { avc: { format: "avc" } },
-    },
-    {
-      container: "webm",
-      format: () => new WebMOutputFormat(),
-      mimeType: "video/webm",
-      videoSourceCodec: "vp9",
-      codec: "vp09.00.10.08",
-      extra: {},
-    },
-    {
-      container: "webm",
-      format: () => new WebMOutputFormat(),
-      mimeType: "video/webm",
-      videoSourceCodec: "vp8",
-      codec: "vp8",
-      extra: {},
-    },
-    {
-      container: "webm",
-      format: () => new WebMOutputFormat(),
-      mimeType: "video/webm",
-      videoSourceCodec: "av1",
-      codec: "av01.0.08M.08",
-      extra: {},
-    },
-  ];
-  const accels = hwEncode
-    ? ["prefer-hardware", "no-preference"]
-    : ["prefer-software", "no-preference"];
-  if (codecHint) {
-    // Stable move of the hinted family to the front (Array#sort is stable).
-    const rank = (c) => (c.videoSourceCodec === codecHint ? 0 : 1);
-    codecs = [...codecs].sort((a, b) => rank(a) - rank(b));
-  }
-
-  for (const candidate of codecs.flatMap((c) => accels.map((accel) => ({ ...c, accel })))) {
-    const config = {
-      codec: candidate.codec,
-      width,
-      height,
-      framerate: frameRate,
-      bitrate: targetBitrate(width, height, frameRate),
-      hardwareAcceleration: accelOrNull(candidate.accel),
-      latencyMode,
-      ...candidate.extra,
-    };
-    const support = await VideoEncoder.isConfigSupported(config).catch(
-      () => ({ supported: false }),
-    );
-    if (support.supported) {
-      return { ...candidate, format: candidate.format(), encoderConfig: config };
-    }
-  }
-  return null;
-}
-
-/** `hardwareAcceleration` is optional; "no-preference" is the default anyway. */
-function accelOrNull(accel) {
-  return accel === "no-preference" ? undefined : accel;
-}
-
-/** Human label for a codec's chosen `hardwareAcceleration` preference. */
-function accelLabel(accel) {
-  return accel === "prefer-hardware"
-    ? "hardware-preferred"
-    : accel === "prefer-software"
-      ? "software-forced"
-      : "browser-chosen";
 }
 
 /**
@@ -480,6 +371,9 @@ export async function createGpuContext() {
  *   Hardware preferences for the two codecs.
  * @param {"quality" | "realtime"} [options.encoderLatencyMode]
  * @param {"avc" | "vp9" | "vp8" | "av1"} [options.encoderCodec]
+ * @param {"standard" | "high" | "maximum"} [options.encoderQuality] Output
+ *   quality tier (shared encoder planner, `js/encoder-plan.js`): scales the
+ *   target bitrate. Default "standard".
  * @param {{ device: GPUDevice, canvasFormat: GPUTextureFormat }} [options.gpu]
  *   Pre-created context (otherwise one is requested; the run destroys it).
  * @param {boolean} [options.canvasCapture] Set true to snapshot the WebGPU
@@ -502,6 +396,7 @@ export async function convertVideoToAnaglyphGpu(options) {
     acceleration = {},
     encoderLatencyMode = "quality",
     encoderCodec = null,
+    encoderQuality = "standard",
     gpu = null,
     canvasCapture = false,
     captureDepth = null,
@@ -707,6 +602,7 @@ export async function convertVideoToAnaglyphGpu(options) {
         hwEncode,
         encoderLatencyMode,
         encoderCodec,
+        encoderQuality,
       );
       if (!plan) {
         throw new PipelineError("no supported video encoder found (tried H.264, VP9, VP8, AV1)");
@@ -1618,7 +1514,7 @@ export async function convertVideoToAnaglyphGpu(options) {
         seconds: elapsed,
         fps: elapsed > 0 ? pairCount / elapsed : null,
         container: core.plan.container,
-        encoder: `${core.plan.codec} (${accelLabel(core.plan.accel)})`,
+        encoder: `${core.plan.codec} (${accelLabel(core.plan.accel)}, ${qualityLabel(encoderQuality, core.plan.tier)})`,
         decoder: `${source.codecString} (${decoderMode})`,
         blender: "WebGPU (direct)",
         frameCopy: "none (WebGPU)",

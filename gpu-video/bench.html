@@ -110,6 +110,14 @@
                         <option value="av1">av1</option>
                     </select>
                 </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="quality">Encode quality</label>
+                    <select class="form-select" id="quality">
+                        <option value="standard">standard</option>
+                        <option value="high">high</option>
+                        <option value="maximum">maximum</option>
+                    </select>
+                </div>
                 <div class="col-md-3 d-flex gap-2">
                     <button type="submit" class="btn btn-primary" id="run">Run</button>
                     <button
@@ -147,11 +155,25 @@
             const runButton = document.getElementById("run");
             const copyButton = document.getElementById("copyJson");
 
+            // The clip picker is a <select>: a clip passed via URL that is
+            // not one of the presets (a generated test clip, say) must be
+            // appended as an option first, or `.value =` silently lands on
+            // "" and the page fetches the wrong thing.
+            function setClip(value) {
+                const select = document.getElementById("clip");
+                if (![...select.options].some((o) => o.value === value)) {
+                    const option = document.createElement("option");
+                    option.value = value;
+                    option.textContent = value.split("/").pop();
+                    select.appendChild(option);
+                }
+                select.value = value;
+            }
+
             // Autorun for the harness:
             //   gpu-video/bench.html?clip=../bench/booth2s.mp4&iters=3&autorun=1
             if (params.get("autorun")) {
-                document.getElementById("clip").value =
-                    params.get("clip") || "../bench/booth2s.mp4";
+                setClip(params.get("clip") || "../bench/booth2s.mp4");
                 document.getElementById("direction").value =
                     params.get("direction") || "clockwise";
                 document.getElementById("iters").value = params.get("iters") || "3";
@@ -160,6 +182,7 @@
                 document.getElementById("latency").value =
                     params.get("latency") || "quality";
                 if (params.get("codec")) document.getElementById("codec").value = params.get("codec");
+                if (params.get("quality")) document.getElementById("quality").value = params.get("quality");
                 if (params.get("hwDecode") === "0")
                     document.getElementById("hwDecode").checked = false;
                 if (params.get("hwEncode") === "0")
@@ -344,6 +367,7 @@
                 };
                 const encoderLatencyMode = document.getElementById("latency").value;
                 const encoderCodec = document.getElementById("codec").value || null;
+                const encoderQuality = document.getElementById("quality").value;
 
                 runButton.disabled = true;
                 copyButton.disabled = true;
@@ -363,10 +387,12 @@
                             acceleration,
                             encoderLatencyMode,
                             encoderCodec,
+                            encoderQuality,
                             canvasCapture: capture === "canvas",
                             captureDepth: parseInt(params.get("captureDepth"), 10) || null,
                             motionBatch: parseInt(params.get("motionBatch"), 10) || null,
                         });
+                        window.__lastOutput = result.blob;
                         perIteration.push({
                             fps: result.report.fps,
                             seconds: result.report.seconds,
@@ -393,7 +419,10 @@
 
                 let decodeOnly = null;
                 let encodeOnly = null;
-                if (!lastError && perIteration.length > 0) {
+                // stages=0 skips the per-stage probes (fast end-to-end only
+                // runs, e.g. bench/quality-sweep.mjs).
+                const runStages = params.get("stages") !== "0";
+                if (!lastError && perIteration.length > 0 && runStages) {
                     statusEl.textContent = "decode-only…";
                     try {
                         decodeOnly = await benchDecode(file);

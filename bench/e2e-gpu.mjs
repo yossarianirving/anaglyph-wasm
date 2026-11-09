@@ -16,7 +16,7 @@
  * copyTextureToBuffer encode path instead of canvas capture.
  */
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
@@ -59,6 +59,10 @@ function probe(file) {
   ).toString();
   return streams + side;
 }
+
+/** Output size of the "quality standard baseline" run; the maximum case
+ * compares against it (same clip, same engine, same suite). */
+let qualityBaselineBytes = 0;
 
 const CASES = [
   {
@@ -139,6 +143,44 @@ const CASES = [
       }
       if (!/clockwise -> counter-clockwise/.test(report.reversals)) {
         throw new Error(`expected mirrored reversal, got "${report.reversals}"`);
+      }
+    },
+  },
+  {
+    // Encode-quality option (shared planner, js/encoder-plan.js): the
+    // chosen tier must reach the encoder config (visible in the report's
+    // encoder label) and must produce a proportionally larger file on
+    // real content. If the engine rejects the high-bitrate config the
+    // planner degrades one tier and the label records the degrade — the
+    // size comparison is skipped in that case.
+    name: "quality standard baseline",
+    file: sample("boomerang.mp4"),
+    selects: { encoderQuality: "standard" },
+    expectAudio: false,
+    check(report, output, file) {
+      if (!/quality=standard/.test(report.encoder)) {
+        throw new Error(`quality tier missing from encoder label "${report.encoder}"`);
+      }
+      qualityBaselineBytes = statSync(file).size;
+    },
+  },
+  {
+    name: "quality maximum",
+    file: sample("boomerang.mp4"),
+    selects: { encoderQuality: "maximum" },
+    expectAudio: false,
+    check(report, output, file) {
+      if (!/quality=maximum/.test(report.encoder)) {
+        throw new Error(`quality tier missing from encoder label "${report.encoder}"`);
+      }
+      if (report.encoder.includes("\u2192")) {
+        return; // encoder cap: tier unsupported here, size check n/a
+      }
+      const size = statSync(file).size;
+      if (!(size >= qualityBaselineBytes * 1.5)) {
+        throw new Error(
+          `maximum-quality output ${size} B vs standard baseline ${qualityBaselineBytes} B (expected ≥ 1.5×)`,
+        );
       }
     },
   },
@@ -375,6 +417,9 @@ try {
     }
     if (testCase.anaglyphType) {
       await page.selectOption("#anaglyphType", testCase.anaglyphType);
+    }
+    for (const [id, value] of Object.entries(testCase.selects ?? {})) {
+      await page.selectOption(`#${id}`, value);
     }
     await page.waitForFunction(() => !document.getElementById("submit").disabled);
     await page.click("#submit");

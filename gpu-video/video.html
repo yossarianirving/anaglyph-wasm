@@ -117,6 +117,23 @@
                             >
                         </div>
                     </div>
+                    <div class="col-md-4 mb-3">
+                        <label class="form-label" for="encoderQuality"
+                            >Encode quality</label
+                        >
+                        <select class="form-select form-select-sm" id="encoderQuality">
+                            <option value="standard" selected>
+                                Standard
+                            </option>
+                            <option value="high">High</option>
+                            <option value="maximum">Maximum</option>
+                        </select>
+                        <div class="form-text">
+                            Higher tiers raise the encoder target bitrate
+                            (~2× for High, ~5× for Maximum) — helps blocky,
+                            already-compressed sources; files grow too.
+                        </div>
+                    </div>
                 </div>
 
                 <button
@@ -338,6 +355,7 @@
                             encode: document.getElementById("hwEncode").checked,
                         },
                         canvasCapture: document.getElementById("canvasCapture").checked,
+                        encoderQuality: document.getElementById("encoderQuality").value,
                     });
                 });
 

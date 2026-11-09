@@ -17,7 +17,7 @@
  * not shift any earlier pairing.
  */
 import { execFileSync, spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -60,6 +60,10 @@ function probe(file) {
   ).toString();
   return streams + side;
 }
+
+/** Output size of the "quality standard baseline" run; the maximum case
+ * compares against it (same clip, same engine, same suite). */
+let qualityBaselineBytes = 0;
 
 const CASES = [
   {
@@ -120,6 +124,43 @@ const CASES = [
       }
       if (!/^5\.6\d+s clockwise -> counter-clockwise$/.test(report.reversals)) {
         throw new Error(`expected mirrored reversal at ~5.67s, got "${report.reversals}"`);
+      }
+    },
+  },
+  {
+    // Encode-quality option (shared planner, js/encoder-plan.js): the
+    // chosen tier must reach the encoder config (visible in the report's
+    // encoder label) and must produce a proportionally larger file on
+    // real content. A degrade in the label (engine rejected the higher
+    // bitrate) skips the size comparison.
+    name: "quality standard baseline",
+    file: sample("boomerang.mp4"),
+    selects: { encoderQuality: "standard" },
+    expectAudio: false,
+    check(report, output, file) {
+      if (!/quality=standard/.test(report.encoder)) {
+        throw new Error(`quality tier missing from encoder label "${report.encoder}"`);
+      }
+      qualityBaselineBytes = statSync(file).size;
+    },
+  },
+  {
+    name: "quality maximum",
+    file: sample("boomerang.mp4"),
+    selects: { encoderQuality: "maximum" },
+    expectAudio: false,
+    check(report, output, file) {
+      if (!/quality=maximum/.test(report.encoder)) {
+        throw new Error(`quality tier missing from encoder label "${report.encoder}"`);
+      }
+      if (report.encoder.includes("\u2192")) {
+        return; // encoder cap: tier unsupported here, size check n/a
+      }
+      const size = statSync(file).size;
+      if (!(size >= qualityBaselineBytes * 1.5)) {
+        throw new Error(
+          `maximum-quality output ${size} B vs standard baseline ${qualityBaselineBytes} B (expected ≥ 1.5×)`,
+        );
       }
     },
   },
@@ -351,6 +392,9 @@ try {
     if (testCase.direction) {
       await page.selectOption("#videoDirection", testCase.direction);
     }
+    for (const [id, value] of Object.entries(testCase.selects ?? {})) {
+      await page.selectOption(`#${id}`, value);
+    }
     await page.waitForFunction(() => !document.getElementById("submit").disabled);
     await page.click("#submit");
 
@@ -461,7 +505,7 @@ try {
     execFileSync("ffmpeg", ["-v", "error", "-i", outFile, "-f", "null", "-"]);
     if (testCase.check) {
       try {
-        testCase.check(report, output);
+        testCase.check(report, output, outFile);
       } catch (err) {
         fail(`${testCase.name}: ${err.message}`);
       }

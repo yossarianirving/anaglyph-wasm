@@ -123,6 +123,30 @@
                     </div>
                 </div>
 
+                <div class="mb-3">
+                    <label class="form-label" for="encoderQuality"
+                        >Encode quality:</label
+                    >
+                    <select
+                        class="form-select form-select-sm"
+                        id="encoderQuality"
+                        style="max-width: 14rem"
+                    >
+                        <option value="standard" selected>
+                            Standard
+                        </option>
+                        <option value="high">High</option>
+                        <option value="maximum">Maximum</option>
+                    </select>
+                    <div class="form-text">
+                        Raises the encoder target bitrate (~2× for High, ~5×
+                        for Maximum). Helps when the source is already
+                        compressed and blocky — re-encoding at Standard
+                        compounds the artifacts. Hardware encoders benefit
+                        most. Output files grow accordingly.
+                    </div>
+                </div>
+
                 <button
                     type="submit"
                     class="btn btn-primary"
@@ -357,6 +381,7 @@
                             encode: document.getElementById("hwEncode").checked,
                             webgpu: document.getElementById("webgpuBlend").checked,
                         },
+                        encoderQuality: document.getElementById("encoderQuality").value,
                     });
                 });
 

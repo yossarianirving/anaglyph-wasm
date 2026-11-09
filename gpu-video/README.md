@@ -25,12 +25,15 @@ gate.
 ## Run it
 
 Open `gpu-video/video.html` — same controls as `video.html` (direction,
-anaglyph type, HW decode/encode toggles) plus:
+anaglyph type, HW decode/encode toggles, encode quality tier) plus:
 
 - **Canvas capture** — zero-copy encoder input (`new VideoFrame(canvas)`).
   Uncheck it to force the `copyTextureToBuffer → VideoFrame(BGRA bytes)`
   path. The page probes canvas capture once per run and falls back
   automatically if the engine rejects `new VideoFrame(canvas)`.
+- **Encode quality** — Standard/High/Maximum bitrate tiers from the shared
+  planner `js/encoder-plan.js` (used by both pipelines; measured costs and
+  benefits in [BENCH.md](../BENCH.md) § Encode quality tiers).
 - **Strict requirement** — there is no CPU fallback here on purpose. If
   `navigator.gpu` or an adapter is missing, the page says so and refuses to
   convert (use `video.html` on such browsers).
@@ -68,7 +71,7 @@ Files:
 
 | file | contents |
 | --- | --- |
-| `gpu-pipeline.js` | the whole pipeline: `convertVideoToAnaglyphGpu`, GPU context, encoder planning, audio copy, mux, cancel — mirrors the engine-quirk handling of `js/video-pipeline.js` (which stays the reference) |
+| `gpu-pipeline.js` | the whole pipeline: `convertVideoToAnaglyphGpu`, GPU context, audio copy, mux, cancel — encoder planning comes from the shared `js/encoder-plan.js` — mirrors the engine-quirk handling of `js/video-pipeline.js` (which stays the reference) |
 | `shaders.js` | all WGSL: blend, luma, blit, box downsample, SAD compute (`makeSadCompute(tileW)`) |
 | `motion.js` | analysis geometry (ports `motion.rs`), CPU aggregation (`aggregateBlocks` reproduces `match_frames`' median + quality gate), `GpuMotion` pass driver |
 | `tracker.js` | line-for-line JS port of the Rust `DirectionTracker` |
