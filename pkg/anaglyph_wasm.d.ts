@@ -269,11 +269,11 @@ export interface InitOutput {
     readonly yuvframeconverter_dstView: (a: number) => any;
     readonly yuvframeconverter_new: (a: number, b: number, c: number) => [number, number, number];
     readonly yuvframeconverter_planesView: (a: number) => any;
-    readonly wasm_bindgen__convert__closures_____invoke__h11e6b4212b48f600: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h20184457d846f68e: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h43ae07ab71b87fb4: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h43ae07ab71b87fb4_38: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h43ae07ab71b87fb4_39: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_7ee8f35fb00514fd___convert__closures_____invoke___js_sys_d247e7593c669d1___Function_fn_wasm_bindgen_7ee8f35fb00514fd___JsValue_____wasm_bindgen_7ee8f35fb00514fd___sys__Undefined___js_sys_d247e7593c669d1___Function_fn_wasm_bindgen_7ee8f35fb00514fd___JsValue_____wasm_bindgen_7ee8f35fb00514fd___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_7ee8f35fb00514fd___convert__closures_____invoke___wasm_bindgen_7ee8f35fb00514fd___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_7ee8f35fb00514fd___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_7ee8f35fb00514fd___convert__closures_____invoke___wasm_bindgen_7ee8f35fb00514fd___sys__JsNullable_wgpu_4ecdfc00296d3ecf___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_7ee8f35fb00514fd___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_7ee8f35fb00514fd___convert__closures_____invoke___wasm_bindgen_7ee8f35fb00514fd___sys__JsNullable_wgpu_4ecdfc00296d3ecf___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_7ee8f35fb00514fd___JsError___true__38: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_7ee8f35fb00514fd___convert__closures_____invoke___wasm_bindgen_7ee8f35fb00514fd___sys__JsNullable_wgpu_4ecdfc00296d3ecf___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_7ee8f35fb00514fd___JsError___true__39: (a: number, b: number, c: any) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;

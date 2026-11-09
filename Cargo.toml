@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anaglyph-rs = { git = "https://github.com/yossarianirving/anaglyph-rs.git", tag = "0.1.0" }
+anaglyph-rs = { git = "https://github.com/yossarianirving/anaglyph-rs.git"}
 # `gpu` (off by default; see [features]) switches gif blending to the
 # WebGPU compute path: gif_to_anaglyph_async then runs frames through
 # convert_gif_buffer_to_anaglyph_async with a CPU fallback.
