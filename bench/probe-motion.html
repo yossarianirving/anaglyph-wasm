@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>GpuMotion throughput probe</title>
+    </head>
+    <body>
+        <pre id="out">running…</pre>
+        <script type="module">
+            /**
+             * Isolates the motion-stage ceiling: decode a clip and push
+             * every frame through GpuMotion (batched readback, early arm),
+             * pumping samples exactly like the pipeline's pairing pump but
+             * with NO blend/encode work. If frames/s lands near the auto
+             * mode's end-to-end rate, the motion GPU passes themselves —
+             * not the capture FIFO — cap auto mode.
+             *
+             *   probe-motion.html?clip=../bench/boomerang.mp4&batch=8
+             * Results land on window.__result.
+             */
+            import {
+                ALL_FORMATS,
+                BlobSource,
+                EncodedPacketSink,
+                Input,
+            } from "../vendor/mediabunny.mjs";
+            import { GpuMotion } from "../gpu-video/motion.js";
+
+            window.__result = null;
+            const params = new URLSearchParams(location.search);
+            const clipUrl = params.get("clip") || "../bench/boomerang.mp4";
+            const batchK = parseInt(params.get("batch"), 10) || 8;
+            // mode=external: real VideoFrames through importExternalTexture.
+            // mode=plain: motion passes sample one static texture2d (the
+            //   frames only drive the count) — isolates per-frame video
+            //   import / YUV-conversion cost from the passes themselves.
+            // mode=compute: same passes but sampling a pre-imported copy
+            //   of one decoded frame (texture2d) — pass cost with real
+            //   content, video import fully out of the measured loop.
+            // mode=stage: each frame copyExternalImageToTexture'd into a
+            //   texture once, then passes sample it (texture2d) — the
+            //   convert-once-per-frame alternative to per-draw external
+            //   sampling.
+            // mode=decode: plain decode-and-close (plumbing baseline).
+            const mode = params.get("mode") || "external";
+            const out = document.getElementById("out");
+
+            async function run() {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) throw new Error("no WebGPU adapter");
+                const device = await adapter.requestDevice();
+
+                const response = await fetch(clipUrl);
+                if (!response.ok) throw new Error(`could not fetch ${clipUrl}`);
+                const blob = await response.blob();
+
+                let motion = null;
+                let frames = 0;
+                let drained = 0;
+                let submitCpu = 0;
+                let nextCpu = 0;
+                let waitMs = 0;
+                let waitN = 0;
+                let decodingDone = false;
+                /** @type {VideoFrame[]} kept open until the sample drains */
+                const openFrames = [];
+                let plainView = null;
+                /** @type {GPUTexture[]} @type {GPUTextureView[]} */
+                const ringTexs = [];
+                const ringViews = [];
+                let ringIdx = -1;
+
+                const decoder = new VideoDecoder({
+                    output(frame) {
+                        frames += 1;
+                        if (mode === "decode") {
+                            frame.close();
+                            return;
+                        }
+                        const stagedSource = mode !== "external";
+                        motion ??= new GpuMotion(
+                            device,
+                            stagedSource
+                                ? { width: frame.displayWidth, height: frame.displayHeight }
+                                : { width: frame.codedWidth, height: frame.codedHeight },
+                            { x0: 0, y0: 0, w: 1, h: 1 },
+                            0,
+                            stagedSource ? "texture2d" : "external",
+                            { earlyArm: true, batchK },
+                        );
+                        let view = null;
+                        if (mode === "plain" || mode === "compute") {
+                            if (!plainView) {
+                                const cw = frame.displayWidth;
+                                const ch = frame.displayHeight;
+                                const tex = device.createTexture({
+                                    size: { width: cw, height: ch },
+                                    format: "rgba8unorm",
+                                    usage:
+                                        GPUTextureUsage.TEXTURE_BINDING |
+                                        GPUTextureUsage.COPY_DST |
+                                        GPUTextureUsage.RENDER_ATTACHMENT,
+                                });
+                                if (mode === "plain") {
+                                    const enc = device.createCommandEncoder();
+                                    const pass = enc.beginRenderPass({
+                                        colorAttachments: [
+                                            {
+                                                view: tex.createView(),
+                                                clearValue: { r: 0.5, g: 0.5, b: 0.5, a: 1 },
+                                                loadOp: "clear",
+                                                storeOp: "store",
+                                            },
+                                        ],
+                                    });
+                                    pass.end();
+                                    device.queue.submit([enc.finish()]);
+                                } else {
+                                    // One-time GPU copy of a real frame;
+                                    // enqueued ahead of every motion pass.
+                                    device.queue.copyExternalImageToTexture(
+                                        { source: frame },
+                                        { texture: tex },
+                                        { width: cw, height: ch },
+                                    );
+                                }
+                                plainView = tex.createView();
+                            }
+                            view = plainView;
+                        } else if (mode === "stage") {
+                            if (ringViews.length === 0) {
+                                for (let i = 0; i < 4; i++) {
+                                    const tex = device.createTexture({
+                                        size: {
+                                            render: false,
+                                            width: frame.displayWidth,
+                                            height: frame.displayHeight,
+                                        },
+                                        format: "rgba8unorm",
+                                        usage:
+                                            GPUTextureUsage.TEXTURE_BINDING |
+                                            GPUTextureUsage.COPY_DST |
+                                            GPUTextureUsage.RENDER_ATTACHMENT,
+                                    });
+                                    ringTexs.push(tex);
+                                    ringViews.push(tex.createView());
+                                }
+                            }
+                            ringIdx = (ringIdx + 1) % ringTexs.length;
+                            device.queue.copyExternalImageToTexture(
+                                { source: frame },
+                                { texture: ringTexs[ringIdx] },
+                                {
+                                    width: frame.displayWidth,
+                                    height: frame.displayHeight,
+                                },
+                            );
+                            view = ringViews[ringIdx];
+                        }
+                        const t = performance.now();
+                        motion.submit(stagedSource ? null : frame, view);
+                        submitCpu += performance.now() - t;
+                        if (mode === "plain" || mode === "compute") {
+                            frame.close();
+                        } else {
+                            // The GPU pass (or the copy) may not have run
+                            // yet: the frame must stay open until its
+                            // sample drains.
+                            openFrames.push(frame);
+                        }
+                    },
+                    error(e) {
+                        window.__result = { error: `decoder: ${e}` };
+                    },
+                });
+
+                async function pump() {
+                    for (;;) {
+                        if (drained >= frames) {
+                            if (decodingDone) return;
+                            await new Promise((r) => setTimeout(r, 1));
+                            continue;
+                        }
+                        if (!motion.isReady()) {
+                            const t = performance.now();
+                            await motion.headSettled();
+                            waitMs += performance.now() - t;
+                            waitN += 1;
+                            continue;
+                        }
+                        const t = performance.now();
+                        await motion.nextSample();
+                        nextCpu += performance.now() - t;
+                        drained += 1;
+                        openFrames.shift()?.close();
+                    }
+                }
+
+                const input = new Input({
+                    source: new BlobSource(blob),
+                    formats: ALL_FORMATS,
+                });
+                try {
+                    const track = await input.getPrimaryVideoTrack();
+                    decoder.configure(await track.getDecoderConfig());
+                    const started = performance.now();
+                    const pumpDone = mode === "decode" ? Promise.resolve() : pump();
+                    const sink = new EncodedPacketSink(track);
+                    for await (const packet of sink.packets()) {
+                        decoder.decode(packet.toEncodedVideoChunk());
+                        while (decoder.decodeQueueSize > 32) {
+                            await new Promise((r) =>
+                                decoder.addEventListener("dequeue", r, { once: true }),
+                            );
+                        }
+                    }
+                    await decoder.flush();
+                    decoder.close();
+                    decodingDone = true;
+                    motion?.flush();
+                    await pumpDone;
+                    const seconds = (performance.now() - started) / 1e3;
+                    window.__result = {
+                        frames,
+                        seconds,
+                        fps: frames / seconds,
+                        batchK,
+                        submitCpuMs: submitCpu,
+                        nextCpuMs: nextCpu,
+                        waitMs,
+                        waitN,
+                        mapMs: motion?.mapMs ?? 0,
+                        mapN: motion?.mapN ?? 0,
+                    };
+                    out.textContent = JSON.stringify(window.__result, null, 2);
+                } finally {
+                    motion?.close();
+                    input.dispose();
+                    device.destroy();
+                }
+            }
+
+            run().catch((e) => {
+                window.__result = { error: String((e && e.stack) || e) };
+                out.textContent = window.__result.error;
+            });
+        </script>
+    </body>
+</html>

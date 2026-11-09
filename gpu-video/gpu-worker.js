@@ -45,7 +45,7 @@ async function startConversion(data) {
       direction: data.direction,
       anaglyphType: data.anaglyphType,
       acceleration: data.acceleration,
-      canvasCapture: data.canvasCapture !== false,
+      canvasCapture: data.canvasCapture ?? false,
       gpu,
       onProgress: (status) => postMessage({ type: "video-progress", ...status }),
       signal: controller.signal,

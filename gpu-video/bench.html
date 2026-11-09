@@ -156,7 +156,7 @@
                     params.get("direction") || "clockwise";
                 document.getElementById("iters").value = params.get("iters") || "3";
                 document.getElementById("capture").value =
-                    params.get("capture") || "canvas";
+                    params.get("capture") || "bytes";
                 document.getElementById("latency").value =
                     params.get("latency") || "quality";
                 if (params.get("codec")) document.getElementById("codec").value = params.get("codec");
@@ -364,6 +364,8 @@
                             encoderLatencyMode,
                             encoderCodec,
                             canvasCapture: capture === "canvas",
+                            captureDepth: parseInt(params.get("captureDepth"), 10) || null,
+                            motionBatch: parseInt(params.get("motionBatch"), 10) || null,
                         });
                         perIteration.push({
                             fps: result.report.fps,

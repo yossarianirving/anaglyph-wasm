@@ -138,9 +138,20 @@ export class GpuMotion {
    *   mode; `texture2d` for engines staging frames via
    *   `copyExternalImageToTexture` (submit() then takes a staged view).
    */
-  constructor(device, { width, height }, crop, flip = 0, source = "external") {
+  constructor(
+    device,
+    { width, height },
+    crop,
+    flip = 0,
+    source = "external",
+    { earlyArm = false, batchK = 8 } = {},
+  ) {
     this.device = device;
     this.crop = crop;
+    /** Batching switch: pipelined emit reads motion samples back in
+     * batches (see _batchK); the serial emit path (iOS, canvas capture)
+     * keeps the per-frame await order that was verified on device. */
+    this._earlyArm = earlyArm;
     this.geo = analysisGeometry(width, height);
     const { w, h, gridW, gridH } = this.geo;
 
@@ -285,16 +296,33 @@ export class GpuMotion {
         )
       : null;
 
-    // Readback buffer pool (MAP_READ buffers can't be reused while
-    // mapped; one per outstanding frame, bounded by the pending cap).
+    // Readback: with early arm (pipelined emit), samples land in batched
+    // buffers — up to _batchK frames share one MAP_READ buffer and ONE
+    // mapAsync armed at batch close. Each map completion is a GPU-process
+    // round trip; one per K frames amortizes them. Batch buffers come from
+    // a free list (recycled once every slot has been read and the batch
+    // unmapped) so submit() never has to wait for one — with a fixed pair,
+    // a lagging pump would stall the decode chain. Without early arm
+    // (serial emit: iOS, canvas capture), the classic one-buffer-per-frame
+    // pool keeps the device-verified per-frame await order.
     /** @type {GPUBuffer[]} */
     this._pool = [];
+    /** @type {GPUBuffer[]} unmapped batch buffers ready for reuse */
+    this._batchPool = [];
+    this._batchK = earlyArm ? Math.max(1, batchK) : 1;
+    /** @type {{buffer: GPUBuffer, slotsUsed: number, consumed: number,
+     *   settled: boolean, map: Promise<void> | null,
+     *   settledP: Promise<void>, resolveSettled: () => void} | null} */
+    this._activeBatch = null;
     /** @type {Array<{buffer: GPUBuffer | null, immediate: boolean}>} */
     this._pending = [];
     this._havePrev = false;
     this._curIdx = 0;
     this._closed = false;
     this._importer = makeImporter(device);
+    /** diagnostics: batch-map armed→settled latency total/count */
+    this.mapMs = 0;
+    this.mapN = 0;
   }
 
   _uniform(data) {
@@ -315,6 +343,58 @@ export class GpuMotion {
       });
     }
     return buf;
+  }
+
+  /** Start a batch accepting new frame slots; takes a recycled buffer or
+   * creates one (the pool stays small — buffers return once fully read). */
+  _openBatch() {
+    const buffer =
+      this._batchPool.pop() ??
+      this.device.createBuffer({
+        size: Math.max(this._blockBytes * this._batchK, 16),
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+    let resolveSettled;
+    const settledP = new Promise((resolve) => {
+      resolveSettled = resolve;
+    });
+    this._activeBatch = {
+      buffer,
+      slotsUsed: 0,
+      consumed: 0,
+      settled: false,
+      map: null,
+      settledP,
+      resolveSettled,
+    };
+    return this._activeBatch;
+  }
+
+  /** Stop the active batch accepting slots and start its single readback
+   * map. mapAsync cannot be armed before every write of the batch is
+   * enqueued (writes to a mapped buffer are invalid), so the map covering
+   * K frames can only start once the batch is full — or at stream end via
+   * `flush()`. */
+  _closeBatch() {
+    const batch = this._activeBatch;
+    if (!batch || batch.slotsUsed === 0) return;
+    this._activeBatch = null;
+    const armedAt = performance.now();
+    batch.map = batch.buffer.mapAsync(GPUMapMode.READ);
+    const settle = () => {
+      this.mapMs += performance.now() - armedAt;
+      this.mapN += 1;
+      batch.settled = true;
+      batch.resolveSettled();
+    };
+    // Failures settle too; nextSample() re-awaits and surfaces them.
+    batch.map.then(settle, settle);
+  }
+
+  /** Close a partial batch so its frames' samples can resolve once the
+   * stream ends (no further submits will arrive to fill it). */
+  flush() {
+    this._closeBatch();
   }
 
   /** Import a VideoFrame as an external texture (entry-point probing in
@@ -384,7 +464,6 @@ export class GpuMotion {
 
     // 3. SAD against the stored predecessor + readback.
     if (this._havePrev && this.sadPipe) {
-      const readBuf = this._takeBuffer();
       cp.setPipeline(this.sadPipe);
       cp.setBindGroup(0, this.sadBinds[this._curIdx]);
       cp.dispatchWorkgroups(
@@ -392,9 +471,34 @@ export class GpuMotion {
         this.geo.gridH,
       );
       cp.end();
-      encoder.copyBufferToBuffer(this.blockBuf, 0, readBuf, 0, this._blockBytes);
-      device.queue.submit([encoder.finish()]);
-      this._pending.push({ buffer: readBuf, immediate: false });
+      if (this._batchK > 1) {
+        // Batched early arm: copy into this frame's slot of the active
+        // batch and arm the one map covering the batch when it fills.
+        const batch = this._activeBatch ?? this._openBatch();
+        const offset = batch.slotsUsed * this._blockBytes;
+        encoder.copyBufferToBuffer(
+          this.blockBuf,
+          0,
+          batch.buffer,
+          offset,
+          this._blockBytes,
+        );
+        batch.slotsUsed += 1;
+        device.queue.submit([encoder.finish()]);
+        if (batch.slotsUsed === this._batchK) this._closeBatch();
+        this._pending.push({ batch, offset, immediate: false });
+      } else {
+        const readBuf = this._takeBuffer();
+        encoder.copyBufferToBuffer(
+          this.blockBuf,
+          0,
+          readBuf,
+          0,
+          this._blockBytes,
+        );
+        device.queue.submit([encoder.finish()]);
+        this._pending.push({ buffer: readBuf, immediate: false, settled: false });
+      }
     } else {
       cp.end();
       device.queue.submit([encoder.finish()]);
@@ -406,6 +510,37 @@ export class GpuMotion {
   }
 
   /**
+   * Whether the next `nextSample()` would resolve without waiting for
+   * the GPU (the head readback's map already settled, or the frame is
+   * the seed frame with no sample).
+   * @returns {boolean}
+   */
+  isReady() {
+    const item = this._pending[0];
+    if (!item || item.immediate) return true;
+    // A batch item is ready once its (batch-level) map has settled; an
+    // unclosed head batch is not — only flush() can close it, so the
+    // pump waits on headSettled(), which resolves at close + map.
+    return item.batch ? item.batch.settled : item.settled;
+  }
+
+  /**
+   * Promise that settles once the head pending sample's map has
+   * resolved or failed (failures surface through `nextSample()`).
+   * Resolves immediately when nothing is outstanding.
+   * @returns {Promise<void>}
+   */
+  headSettled() {
+    const item = this._pending[0];
+    if (!item || item.immediate) return Promise.resolve();
+    if (item.batch) return item.batch.settledP;
+    return (item.map ?? item.buffer.mapAsync(GPUMapMode.READ)).then(
+      () => {},
+      () => {},
+    );
+  }
+
+  /**
    * Resolve the next frame's drift sample (FIFO with `submit`).
    * @returns {Promise<{dx: number, reliable: boolean}>}
    */
@@ -413,8 +548,25 @@ export class GpuMotion {
     const item = this._pending.shift();
     if (!item) throw new Error("GpuMotion.nextSample: no pending frame");
     if (item.immediate) return { ...NO_PREV };
+    if (item.batch) {
+      const batch = item.batch;
+      await batch.map;
+      if (this._closed) return { ...NO_PREV };
+      // View the slot's blocks straight from the mapped range — no copy.
+      // aggregateBlocks reads synchronously while still mapped, and the
+      // batch unmaps only after its last frame has been consumed.
+      const blocks = new Float32Array(
+        batch.buffer.getMappedRange(item.offset, this._blockBytes),
+      );
+      const sample = aggregateBlocks(blocks, this.geo);
+      if (++batch.consumed === batch.slotsUsed) {
+        batch.buffer.unmap();
+        this._batchPool.push(batch.buffer);
+      }
+      return sample;
+    }
     const { buffer } = item;
-    await buffer.mapAsync(GPUMapMode.READ);
+    await (item.map ?? buffer.mapAsync(GPUMapMode.READ));
     let sample;
     if (this._closed) {
       buffer.destroy();
@@ -432,11 +584,16 @@ export class GpuMotion {
   close() {
     this._closed = true;
     for (const item of this._pending) {
-      if (item.buffer) item.buffer.destroy();
+      // Batch items share their buffer; double destroy is a no-op.
+      const buf = item.batch ? item.batch.buffer : item.buffer;
+      if (buf) buf.destroy();
     }
     this._pending = [];
+    this._activeBatch = null;
     for (const buf of this._pool) buf.destroy();
     this._pool = [];
+    for (const buf of this._batchPool) buf.destroy();
+    this._batchPool = [];
     this.fullTex.destroy();
     for (const t of this.smallTex) t.destroy();
     for (const b of [this.lumaU, this.boxU, this.sadU, this.rangesBuf, this.blockBuf]) {

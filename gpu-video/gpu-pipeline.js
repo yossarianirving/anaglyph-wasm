@@ -64,6 +64,16 @@ const KEYFRAME_INTERVAL_S = 2;
 class PipelineError extends Error {}
 
 /**
+ * iOS Safari is validated on the SERIAL external-source emit (device test,
+ * tag `ios-safari-working-2026-11-08`), so its encode path keeps the
+ * pair-at-a-time issue order. Everywhere else the bytes emit pipelines.
+ */
+const IS_IOS =
+  typeof navigator !== "undefined" &&
+  (/iP(hone|od|ad)/.test(navigator.userAgent || "") ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+/**
  * Eye matrices from anaglyph-rs `anaglyph.rs`, flat row-major exactly as
  * Rust stores them: row `c` of an eye holds the coefficients of OUTPUT
  * channel `c` across the input channels
@@ -472,8 +482,14 @@ export async function createGpuContext() {
  * @param {"avc" | "vp9" | "vp8" | "av1"} [options.encoderCodec]
  * @param {{ device: GPUDevice, canvasFormat: GPUTextureFormat }} [options.gpu]
  *   Pre-created context (otherwise one is requested; the run destroys it).
- * @param {boolean} [options.canvasCapture] Set false to force the
- *   `copyTextureToBuffer` encode path (benchmark A/B of the capture modes).
+ * @param {boolean} [options.canvasCapture] Set true to snapshot the WebGPU
+ *   canvas into the encoder (`new VideoFrame(canvas)`, zero-copy on paper).
+ *   Default false: the `copyTextureToBuffer` → `new VideoFrame(bytes)` feed
+ *   ingests at 6–9k fps vs ~1.5k for canvas snapshots on this host's
+ *   measurements, and it is the encoder path the WASM solution uses.
+ * @param {number} [options.captureDepth] Override the pipelined-emit FIFO
+ *   depth (default 16; 4 in auto mode — motion samples queue behind
+ *   outstanding pixel maps). `1` re-serializes the pipelined path.
  * @param {(status: object) => void} [options.onProgress]
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<{ blob: Blob, report: object, stageMs: object }>}
@@ -487,7 +503,9 @@ export async function convertVideoToAnaglyphGpu(options) {
     encoderLatencyMode = "quality",
     encoderCodec = null,
     gpu = null,
-    canvasCapture = true,
+    canvasCapture = false,
+    captureDepth = null,
+    motionBatch = null,
     onProgress = () => {},
     signal,
   } = options;
@@ -655,6 +673,13 @@ export async function convertVideoToAnaglyphGpu(options) {
         rotationNote = `${srcRot}\u00b0 (container) on ${videoFrame.codedWidth}\u00d7${videoFrame.codedHeight} frames`;
       }
 
+      // (A "staged" source was tried and rejected: copyExternalImageToTexture
+      // from VideoFrame converts at ~1.1 ms/frame on this host — no cheaper
+      // than per-pass texture_external sampling at ~0.88 ms (both paths pay
+      // the YUV→RGB conversion; bench/probe-motion.html modes stage vs
+      // external, 863 vs 1134 f/s at 480×270). Sampling at draw time is
+      // actually cheaper because the shader converts only what it reads.)
+      //
       // Engine stores the *visible rect* of a VideoFrame as the external
       // texture (already cropped, top row first on spec-conforming
       // engines); the crop uniform therefore only trims the last row or
@@ -787,6 +812,14 @@ export async function convertVideoToAnaglyphGpu(options) {
         ? await probeCanvasCapture(device, context.canvasFormat, width, height)
         : null;
       const captureMode = capture ? "canvas" : "bytes";
+      // Pipelined emit overlaps each pair's readback gate with the next
+      // blends (issue up to CAPTURE_DEPTH ahead, drain in order). Canvas
+      // source mode always uses it (Firefox mapAsync batching, see
+      // issuePairPipelined); external source mode uses it for the bytes
+      // encode — Chrome's ~2 ms serial gate is pure dead time otherwise.
+      // iOS keeps the serial path: that is the device-verified order.
+      const pipelinedEmit =
+        sourceMode === "canvas" || (captureMode === "bytes" && !IS_IOS);
       // Gate buffer: one copied row (256 B) whose mapAsync marks the
       // command buffer complete; full-size pixel buffer only in bytes mode.
       const gatePool = new GpuBufferPool(
@@ -816,6 +849,7 @@ export async function convertVideoToAnaglyphGpu(options) {
             crop,
             yFlip,
             sourceMode === "canvas" ? "texture2d" : "external",
+            { earlyArm: pipelinedEmit, batchK: motionBatch ?? 8 },
           )
         : null;
 
@@ -891,6 +925,27 @@ export async function convertVideoToAnaglyphGpu(options) {
           ringSlots.push(slot);
           return slot;
         };
+      } else if (pipelinedEmit) {
+        // Pipelined external bytes emit needs a plainer slot: capture
+        // buffer + bookkeeping only. The pair's external-texture views
+        // are created inside the blend pass itself, and no encoder
+        // canvas exists (VideoFrame is built from readback bytes).
+        makeRingSlot = () => {
+          const slot = {
+            left: null,
+            right: null,
+            cap: null,
+            /** pixel readback buffer while in flight */
+            buffer: null,
+            /** mapAsync promise on that buffer */
+            map: null,
+            pair: null,
+            outTimestamp: 0,
+            durationUs: 0,
+          };
+          ringSlots.push(slot);
+          return slot;
+        };
       }
 
       return {
@@ -905,6 +960,11 @@ export async function convertVideoToAnaglyphGpu(options) {
         strategy,
         motion,
         captureMode,
+        pipelinedEmit,
+        /** Pipelined external emit defers decoded-frame close to the
+         * pair's gate readback (external views keep the VideoFrame
+         * alive until the blend pass has run). */
+        closeFramesOnDrain: pipelinedEmit && sourceMode === "external",
         yFlip,
         sourceMode,
         stageMotion,
@@ -924,6 +984,11 @@ export async function convertVideoToAnaglyphGpu(options) {
         gatePool,
         pixelPool,
         bpr,
+        /** Reusable packed-layout scratch for the readback rows in bytes
+         * mode — `new VideoFrame(bytes)` copies synchronously, so one
+         * buffer serves every pair instead of a fresh 518 KB alloc+copy. */
+        packedBuf:
+          captureMode === "bytes" ? new Uint8Array(width * 4 * height) : null,
         captureColorSpace: colorSpaceInit(videoFrame.colorSpace),
       };
     }
@@ -967,8 +1032,9 @@ export async function convertVideoToAnaglyphGpu(options) {
         ],
       });
       // External mode imports inside the pass (external-texture views
-      // cannot leave it). Canvas/source-mode pairs take the pipelined
-      // path below instead of this function.
+      // cannot leave it). Serial emit now only serves external+canvas
+      // capture and the iOS bytes path; everything else takes the
+      // pipelined path below.
       const leftView = importExternal(pass, pair.left.frame);
       const rightView = importExternal(pass, pair.right.frame);
       const blendBind = device.createBindGroup({
@@ -1036,18 +1102,21 @@ export async function convertVideoToAnaglyphGpu(options) {
         });
       } else {
         await withAbort(pixels.mapAsync(GPUMapMode.READ));
-        const data = new Uint8Array(pixels.getMappedRange().slice(0));
-        pixels.unmap();
-        core.pixelPool.release(pixels);
+        const mapped = new Uint8Array(pixels.getMappedRange());
         // Compact the 256-byte-aligned readback rows into the packed
         // layout VideoFrame(bytes) assumes (Chromium ignores or
-        // mis-handles `bytesPerRow` in the constructor — measured).
+        // mis-handles `bytesPerRow` in the constructor — measured). The
+        // shared scratch is fine: the constructor copies synchronously.
         const rowBytes = core.width * 4;
-        const packed = new Uint8Array(rowBytes * core.height);
         for (let y = 0; y < core.height; y++) {
-          packed.set(data.subarray(y * core.bpr, y * core.bpr + rowBytes), y * rowBytes);
+          core.packedBuf.set(
+            mapped.subarray(y * core.bpr, y * core.bpr + rowBytes),
+            y * rowBytes,
+          );
         }
-        outFrame = new VideoFrame(packed, {
+        pixels.unmap();
+        core.pixelPool.release(pixels);
+        outFrame = new VideoFrame(core.packedBuf, {
           format: "BGRA",
           codedWidth: core.width,
           codedHeight: core.height,
@@ -1066,20 +1135,25 @@ export async function convertVideoToAnaglyphGpu(options) {
       if (pairCount % 10 === 0) reportProgress();
     }
 
-    // ---- Pipelined capture (canvas source mode) ----------------------
+    // ---- Pipelined capture (default emit) ----------------------------
     //
-    // Firefox resolves mapAsync completions on a ~10 Hz GPU-process tick
-    // (bench/probe-mapasync.mjs: ~100 ms serial), so gating every pair on
-    // its own gate readback caps throughput at ~10 pairs/s regardless of
-    // GPU speed. Batches of outstanding maps DO resolve together on one
-    // tick, so canvas mode issues up to CAPTURE_DEPTH blends ahead and
-    // drains the FIFO in pair order: ~CAPTURE_DEPTH pairs per tick. Each
-    // in-flight pair owns a ring slot (its left/right frame stagers and
-    // capture canvas), so queued staging copies and canvas snapshots of
-    // different pairs never alias. The external path keeps the serial
-    // emit above — 2 ms gates on Chrome, and the iOS-verified behaviour.
-    const CAPTURE_DEPTH = 16;
-    /** @type {object[]} FIFO of in-flight ring slots (canvas mode only) */
+    // Gating every pair on its own readback mapAsync is pure dead time:
+    // Firefox resolves maps on a ~10 Hz GPU-process tick
+    // (bench/probe-mapasync.mjs: ~100 ms serial, batches resolve
+    // together), and Chrome's ~2 ms serial gate idles the CPU between
+    // blends. So issue up to CAPTURE_DEPTH pairs ahead and drain the
+    // FIFO in pair order. In canvas source mode each in-flight pair owns
+    // a ring slot (its left/right frame stagers and capture canvas) so
+    // queued staging copies and canvas snapshots never alias; in
+    // external source mode the slot just holds the pixel readback and
+    // the pair's decoded frames close when its gate resolves. iOS keeps
+    // the serial emit above — the device-verified behaviour.
+    //
+    // (An earlier shallow-ring rule for auto mode dated from per-frame
+    // motion maps queueing behind the pixel maps; motion readbacks are
+    // batched now, and a depth sweep at 480×270 measured 16 == 4.)
+    const CAPTURE_DEPTH = captureDepth ?? 16;
+    /** @type {object[]} FIFO of in-flight ring slots */
     const pending = [];
 
     /** Blend one pair into a ring slot, submit, and start its gate map. */
@@ -1087,6 +1161,14 @@ export async function convertVideoToAnaglyphGpu(options) {
       t0Us ??= pair.timestamp;
       const durationUs = pair.duration > 0 ? pair.duration : fallbackDurationUs;
       const outTimestamp = pair.timestamp - t0Us;
+      if (core.closeFramesOnDrain) {
+        // A decoded frame feeds two consecutive sliding-window pairs;
+        // register both refs up front — a depth-wait drain below runs
+        // before this pair is even slotted, and it must not close a
+        // frame this pair is about to import.
+        pair.left.livePairs += 1;
+        pair.right.livePairs += 1;
+      }
       while (pending.length >= CAPTURE_DEPTH) await drainOldest();
       checkAbort();
 
@@ -1107,12 +1189,22 @@ export async function convertVideoToAnaglyphGpu(options) {
           },
         ],
       });
-      // Queue-side staging: the copyExternalImageToTexture inside runs
-      // before this submission (queue ops are submitted in order), and
-      // the slot is only recycled after this pair's gate resolved, so no
-      // later drawImage can race this pair's queued copies.
-      const leftView = slot.left.stage(pair.left.frame);
-      const rightView = slot.right.stage(pair.right.frame);
+      // External imports must be created inside the pass that samples
+      // them (views cannot leave it); canvas-mode pairs stage into their
+      // slot's textures instead.
+      let leftView;
+      let rightView;
+      if (core.sourceMode === "canvas") {
+        // Queue-side staging: the copyExternalImageToTexture inside runs
+        // before this submission (queue ops are submitted in order), and
+        // the slot is only recycled after this pair's gate resolved, so no
+        // later drawImage can race this pair's queued copies.
+        leftView = slot.left.stage(pair.left.frame);
+        rightView = slot.right.stage(pair.right.frame);
+      } else {
+        leftView = importExternal(pass, pair.left.frame);
+        rightView = importExternal(pass, pair.right.frame);
+      }
       const blendBind = device.createBindGroup({
         layout: core.blendPipe.getBindGroupLayout(0),
         entries: [
@@ -1174,6 +1266,20 @@ export async function convertVideoToAnaglyphGpu(options) {
       const slot = pending[0];
       const captureStart = performance.now();
       await withAbort(slot.map);
+      if (core.closeFramesOnDrain && slot.pair) {
+        // The gate resolved: this pair's blend pass has run. Close each
+        // decoded frame once the last sliding-window pair referencing it
+        // has run AND the pairing watermark has passed it.
+        for (const e of [slot.pair.left, slot.pair.right]) {
+          if (--e.livePairs === 0 && e.released) {
+            try {
+              e.frame.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        }
+      }
       let outFrame;
       if (core.captureMode === "canvas") {
         // The command buffer completed (gate resolved), so the canvas
@@ -1184,19 +1290,18 @@ export async function convertVideoToAnaglyphGpu(options) {
           duration: slot.durationUs,
         });
       } else {
-        const data = new Uint8Array(slot.buffer.getMappedRange().slice(0));
-        slot.buffer.unmap();
+        const mapped = new Uint8Array(slot.buffer.getMappedRange());
         // Compact the 256-byte-aligned readback rows into the packed
         // layout VideoFrame(bytes) assumes (see emitPair).
         const rowBytes = core.width * 4;
-        const packed = new Uint8Array(rowBytes * core.height);
         for (let y = 0; y < core.height; y++) {
-          packed.set(
-            data.subarray(y * core.bpr, y * core.bpr + rowBytes),
+          core.packedBuf.set(
+            mapped.subarray(y * core.bpr, y * core.bpr + rowBytes),
             y * rowBytes,
           );
         }
-        outFrame = new VideoFrame(packed, {
+        slot.buffer.unmap();
+        outFrame = new VideoFrame(core.packedBuf, {
           format: "BGRA",
           codedWidth: core.width,
           codedHeight: core.height,
@@ -1234,6 +1339,21 @@ export async function convertVideoToAnaglyphGpu(options) {
     function releaseFramesBefore(releasedBefore) {
       for (const [index, entry] of pendingEntries) {
         if (index >= releasedBefore) break; // insertion == index order
+        if (core.closeFramesOnDrain) {
+          // Pipelined external emit: close only once every sliding-window
+          // pair referencing this frame has run (drains decrement
+          // livePairs); until then the frame's close is owned by drain.
+          entry.released = true;
+          if (entry.livePairs === 0) {
+            try {
+              entry.frame.close();
+            } catch {
+              /* already closed */
+            }
+          }
+          pendingEntries.delete(index);
+          continue;
+        }
         entry.frame.close();
         pendingEntries.delete(index);
       }
@@ -1242,9 +1362,7 @@ export async function convertVideoToAnaglyphGpu(options) {
     function enqueueEmit(pair) {
       emitChain = emitChain
         .then(() =>
-          core.sourceMode === "canvas"
-            ? issuePairPipelined(pair)
-            : emitPair(pair),
+          core.pipelinedEmit ? issuePairPipelined(pair) : emitPair(pair),
         )
         .catch((e) => {
           latch(e);
@@ -1272,6 +1390,75 @@ export async function convertVideoToAnaglyphGpu(options) {
       });
     }
 
+    // ---- Auto mode: sample-gated pairing pump -------------------------
+    //
+    // Pairing a frame needs its motion sample, but the round trip must
+    // not rate-limit it: readback maps are armed at submit (motion.js)
+    // and resolve in batches, so decode keeps feeding motion passes and
+    // this pump pairs frames as their samples settle. Semantics match
+    // the serial path exactly — the tracker still sees each frame's
+    // fresh sample, in order, before that frame pairs; pairing is only
+    // deferred in wall time.
+    /** @type {{entry: object}[]} frames waiting on their motion sample */
+    const trackQueue = [];
+    /** decoded frames held before pairing (throttles the packet feed) */
+    const TRACK_HOLD_LIMIT = 64;
+    let pumpChain = Promise.resolve();
+    let pumpRunning = false;
+    /** pump diagnostics (reported in stageMs): activations, sample-settle
+     * waits, and frames paired — waits/activations shows how bursty the
+     * sample cadence is. */
+    let pumpWakes = 0;
+    let pumpWaits = 0;
+    let pumpPaired = 0;
+    /** resolver waking the packet feed when pairing makes progress */
+    let pairAdvance = null;
+
+    function wakePairAdvance() {
+      if (!pairAdvance) return;
+      const resolve = pairAdvance;
+      pairAdvance = null;
+      resolve();
+    }
+
+    function advancePump() {
+      if (pumpRunning) return;
+      pumpRunning = true;
+      pumpWakes += 1;
+      pumpChain = pumpChain
+        .then(async () => {
+          while (trackQueue.length > 0) {
+            if (!core.motion.isReady()) {
+              // Batched maps: this one wait usually settles the head AND
+              // everything queued behind it, drained next iteration.
+              pumpWaits += 1;
+              const t = performance.now();
+              await withAbort(core.motion.headSettled());
+              stageMs.motion += performance.now() - t;
+            }
+            const held = trackQueue.shift();
+            pumpPaired += 1;
+            pendingSample = await withAbort(core.motion.nextSample());
+            const result = core.strategy.push(held.entry);
+            if (result.reversals.length > 0) {
+              reversalsFound.push(...result.reversals);
+            }
+            for (const pair of result.pairs) enqueueEmit(pair);
+            if (result.releasedBefore >= 0) {
+              emitChain = emitChain
+                .then(() => releaseFramesBefore(result.releasedBefore))
+                .catch(latch);
+            }
+            wakePairAdvance();
+          }
+        })
+        .catch((e) => latch(e))
+        .finally(() => {
+          pumpRunning = false;
+          wakePairAdvance();
+        });
+    }
+
     decoder = new VideoDecoder({
       output(videoFrame) {
         const entry = {
@@ -1279,6 +1466,11 @@ export async function convertVideoToAnaglyphGpu(options) {
           timestamp: videoFrame.timestamp,
           duration: videoFrame.duration ?? 0,
           frame: videoFrame,
+          /** pairs referencing this frame that have not drained yet
+           * (the pairing is a sliding window: a frame feeds two pairs) */
+          livePairs: 0,
+          /** past the pairing watermark (all referencing pairs issued) */
+          released: false,
         };
         pendingEntries.set(entry.index, entry);
         maxFramesHeld = Math.max(maxFramesHeld, pendingEntries.size);
@@ -1286,16 +1478,23 @@ export async function convertVideoToAnaglyphGpu(options) {
           .then(async () => {
             core ??= await planFromFrame(videoFrame);
             if (core.motion) {
-              // Fire-and-forget GPU passes, then wait for this frame's
-              // sample: submitted ahead of the chain, so the GPU work
-              // overlaps the previous frames' encodes.
-              const t = performance.now();
               core.motion.submit(
                 videoFrame,
                 core.stageMotion ? core.stageMotion(videoFrame) : null,
               );
-              pendingSample = await withAbort(core.motion.nextSample());
-              stageMs.motion += performance.now() - t;
+              if (!core.pipelinedEmit) {
+                // Serial emit (iOS / canvas capture): wait for this
+                // frame's sample inline, as on the verified path.
+                const t = performance.now();
+                pendingSample = await withAbort(core.motion.nextSample());
+                stageMs.motion += performance.now() - t;
+              } else {
+                // Pipelined emit: pairing happens on the pump as samples
+                // settle, so this chain never waits on the GPU.
+                trackQueue.push({ entry });
+                advancePump();
+                return;
+              }
             }
             const result = core.strategy.push(entry);
             if (result.reversals.length > 0) {
@@ -1324,6 +1523,17 @@ export async function convertVideoToAnaglyphGpu(options) {
     for await (const packet of packetSink.packets()) {
       checkAbort();
       if (fatalError) throw fatalError;
+      // Auto mode: cap how far decoding may run ahead of sample-gated
+      // pairing, so held decoded frames cannot pile up unboundedly.
+      while (core?.motion && trackQueue.length >= TRACK_HOLD_LIMIT) {
+        await withAbort(
+          new Promise((resolve) => {
+            pairAdvance = resolve;
+          }),
+        );
+        checkAbort();
+        if (fatalError) throw fatalError;
+      }
       decoder.decode(packet.toEncodedVideoChunk());
       const waitStart = performance.now();
       await withAbort(drainQueue(decoder, "decodeQueueSize", DECODE_QUEUE_LIMIT));
@@ -1333,6 +1543,12 @@ export async function convertVideoToAnaglyphGpu(options) {
     // flushes must not strand the caller — see js/video-pipeline.js).
     await withAbort(decoder.flush());
     await withAbort(frameChain);
+    // Close any partial motion batch (its map cannot arm until every
+    // frame's copy is enqueued) so the pairing pump can drain the tail.
+    core?.motion?.flush();
+    // Drain the pairing pump: every submitted frame's sample must reach
+    // the tracker before the strategy can commit its held-back pairs.
+    await withAbort(pumpChain);
     if (fatalError) throw fatalError;
 
     // End of stream: the strategy commits every held-back pair (the last
@@ -1344,8 +1560,8 @@ export async function convertVideoToAnaglyphGpu(options) {
     }
     await withAbort(emitChain);
     if (fatalError) throw fatalError;
-    // Final FIFO drain (canvas mode): the last issued pairs finish after
-    // the issue chain ends.
+    // Final FIFO drain: the last issued pairs finish after the issue
+    // chain ends.
     while (pending.length > 0) await drainOldest();
     for (const entry of pendingEntries.values()) {
       try {
@@ -1390,6 +1606,11 @@ export async function convertVideoToAnaglyphGpu(options) {
     const blob = new Blob([core.output.target.buffer], { type: core.plan.mimeType });
 
     const elapsed = (performance.now() - startedAt) / 1e3;
+    stageMs.pumpWakes = pumpWakes;
+    stageMs.pumpWaits = pumpWaits;
+    stageMs.pumpPaired = pumpPaired;
+    stageMs.motionMapMs = core?.motion?.mapMs ?? 0;
+    stageMs.motionMapN = core?.motion?.mapN ?? 0;
     return {
       blob,
       report: {
@@ -1401,15 +1622,17 @@ export async function convertVideoToAnaglyphGpu(options) {
         decoder: `${source.codecString} (${decoderMode})`,
         blender: "WebGPU (direct)",
         frameCopy: "none (WebGPU)",
-        capture: core.captureMode === "canvas" ? "canvas \u2192 VideoFrame" : "copyToBuffer \u2192 VideoFrame",
+        capture:
+          core.captureMode === "canvas"
+            ? "canvas \u2192 VideoFrame"
+            : core.pipelinedEmit
+              ? "copyToBuffer \u2192 VideoFrame (pipelined)"
+              : "copyToBuffer \u2192 VideoFrame",
         textureSource:
           core.sourceMode === "external"
             ? "importExternalTexture"
             : "drawImage + copyExternalImageToTexture",
-        captureDepth:
-          core.sourceMode === "canvas"
-            ? `pipelined x${CAPTURE_DEPTH}`
-            : "serial",
+        captureDepth: core.pipelinedEmit ? `pipelined x${CAPTURE_DEPTH}` : "serial",
         orientation:
           core.sourceMode === "canvas"
             ? "top-left (canvas copy)"
@@ -1471,8 +1694,8 @@ export async function convertVideoToAnaglyphGpu(options) {
       core.pixelPool?.destroy();
       core.srcTexM?.destroy();
       for (const slot of core.ringSlots ?? []) {
-        slot.left.tex.destroy();
-        slot.right.tex.destroy();
+        slot.left?.tex.destroy();
+        slot.right?.tex.destroy();
       }
     }
     if (context.ownsDevice !== false) {

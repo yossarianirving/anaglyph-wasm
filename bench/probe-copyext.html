@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>copyExternalImageToTexture probe</title>
+    </head>
+    <body>
+        <pre id="out">running…</pre>
+        <script type="module">
+            import {
+                ALL_FORMATS,
+                BlobSource,
+                EncodedPacketSink,
+                Input,
+            } from "../vendor/mediabunny.mjs";
+
+            window.__result = null;
+            const params = new URLSearchParams(location.search);
+            const clipUrl = params.get("clip") || "../bench/booth2s.mp4";
+
+            async function run() {
+                const adapter = await navigator.gpu.requestAdapter();
+                const device = await adapter.requestDevice();
+                const blob = await (await fetch(clipUrl)).blob();
+                const input = new Input({
+                    source: new BlobSource(blob),
+                    formats: ALL_FORMATS,
+                });
+                const track = await input.getPrimaryVideoTrack();
+                let frame = null;
+                const decoder = new VideoDecoder({
+                    output(f) {
+                        if (!frame) frame = f;
+                        else f.close();
+                    },
+                    error(e) {
+                        window.__result = { error: `decoder: ${e}` };
+                    },
+                });
+                decoder.configure(await track.getDecoderConfig());
+                const sink = new EncodedPacketSink(track);
+                for await (const p of sink.packets()) {
+                    decoder.decode(p.toEncodedVideoChunk());
+                    if (frame) break;
+                }
+                await decoder.flush();
+
+                const w = frame.displayWidth;
+                const h = frame.displayHeight;
+                const vis = [frame.visibleWidth, frame.visibleHeight];
+                const tex = device.createTexture({
+                    size: { width: w, height: h },
+                    format: "rgba8unorm",
+                    usage:
+                        GPUTextureUsage.TEXTURE_BINDING |
+                        GPUTextureUsage.COPY_DST |
+                        GPUTextureUsage.COPY_SRC |
+                        GPUTextureUsage.RENDER_ATTACHMENT,
+                });
+                device.queue.copyExternalImageToTexture(
+                    { source: frame },
+                    { texture: tex },
+                    { width: w, height: h },
+                );
+                frame.close();
+                const bpr = (w * 4 + 255) & ~255;
+                const buf = device.createBuffer({
+                    size: bpr * h,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                });
+                const enc = device.createCommandEncoder();
+                enc.copyTextureToBuffer(
+                    { texture: tex },
+                    { buffer: buf, bytesPerRow: bpr },
+                    { width: w, height: h },
+                );
+                device.queue.submit([enc.finish()]);
+                await buf.mapAsync(GPUMapMode.READ);
+                const px = new Uint8Array(buf.getMappedRange());
+                const at = (x, y) => {
+                    const i = y * bpr + x * 4;
+                    return [px[i], px[i + 1], px[i + 2], px[i + 3]];
+                };
+                let sum = 0;
+                for (let i = 0; i < w * h * 4; i += 4 * 37) sum += px[i];
+                window.__result = {
+                    size: [w, h],
+                    visible: vis,
+                    corner: at(0, 0),
+                    center: at(w >> 1, h >> 1),
+                    meanSampled: (sum / (w * h / 37)).toFixed(1),
+                };
+                document.getElementById("out").textContent =
+                    JSON.stringify(window.__result);
+                input.dispose();
+                device.destroy();
+            }
+            run().catch((e) => {
+                window.__result = { error: String((e && e.stack) || e) };
+                document.getElementById("out").textContent =
+                    window.__result.error;
+            });
+        </script>
+    </body>
+</html>

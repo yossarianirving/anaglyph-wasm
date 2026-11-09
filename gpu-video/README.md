@@ -57,7 +57,9 @@ demux (mediabunny) ──► VideoDecoder ──► VideoFrame (held open, GPU-r
        │              blend fragment (two frame sources +
        │              eye-matrix uniform) → BGRA target texture
        │                                   │
-       │              blit → WebGPU OffscreenCanvas ──► VideoFrame(canvas)
+       │              capture (default): copyToBuffer → packed BGRA
+       │              → VideoFrame(bytes); canvas mode blits to an
+       │              OffscreenCanvas → VideoFrame(canvas) instead
        ▼                                   ▼
 mux (mediabunny) ◄── VideoEncoder ◄────────┘        (+ audio stream-copy)
 ```
@@ -105,19 +107,24 @@ Files:
   upper-median + quality-ratio reduction. The workgroup tile size is
   derived from `maxComputeWorkgroupStorageSize` (29 at the 16 KB spec
   minimum, 61 at 32 KB).
-- **Frame-close safety.** In external mode a decoded frame is only closed
-  after the serial emit (blend submit → capture → `encoder.encode`) that
-  referenced it ran. In canvas mode the pipelined path may still have the
-  pair's blend in flight when the pairing window releases the frame —
-  safe because `drawImage` copies the frame's pixels into the slot's
-  scratch canvas synchronously at issue time.
-- **Pipelined capture (canvas mode).** Firefox resolves `mapAsync` on a
-  ~10 Hz GPU-process tick (~100 ms; see `bench/probe-mapasync.mjs`), so
-  a per-pair completion gate would cap throughput at ~10 pairs/s. Canvas
-  mode issues up to 16 blends ahead — each in-flight pair owns a ring
-  slot (frame stagers + capture canvas) — and drains the FIFO in pair
-  order into the encoder (~16 pairs per tick). The external path keeps
-  the serial emit (2 ms gates on Chrome, iOS-verified behaviour).
+- **Frame-close safety.** On the serial emit (iOS, canvas capture) a
+  decoded frame closes after the emit (blend submit → capture →
+  `encoder.encode`) that referenced it ran. On the pipelined emit the
+  pairing window and the capture FIFO overlap, so entries are refcounted:
+  each frame counts the sliding-window pairs referencing it (`livePairs`)
+  and closes when the count hits zero *and* the pairing watermark has
+  passed it (`released`) — the last owner to drain closes it. This is
+  required for external sources, whose imported views keep the
+  `VideoFrame` alive until the blend pass has run.
+- **Pipelined capture.** Firefox resolves `mapAsync` on a ~10 Hz GPU-
+  process tick (~100 ms; see `bench/probe-mapasync.mjs`), so a per-pair
+  completion gate would cap throughput at ~10 pairs/s. The pipelined
+  path issues up to `CAPTURE_DEPTH` (16) blends ahead and drains the
+  FIFO in pair order into the encoder (~16 pairs per tick). Canvas mode
+  owns a ring slot per in-flight pair (frame stagers + capture canvas);
+  bytes mode imports the external textures inside the pass and drains
+  each slot's readback buffer into the shared packed staging array.
+  iOS keeps the serial emit (the device-verified behaviour).
 - **Auto mode holds frames, not copies.** Held-back (unconfirmed) frames
   stay as `VideoFrame` objects pinned by the decoder — bounded by the
   pairing window's pending cap (~20 frames) — instead of being rasterized
@@ -128,59 +135,86 @@ Files:
 | engine | mode | notes |
 | --- | --- | --- |
 | Chrome 151 (Linux/Mesa) | external | full e2e suite green; needs a windowed browser for WebGPU on this host (`headless` → null adapter) |
-| iOS Safari 18 (device) | external | verified working on device at tag `ios-safari-working-2026-11-08`; the pipelined-canvas work keeps this path byte-identical |
-| Firefox 159 | canvas | `importExternalTexture` absent → staged `texture_2d` sources; full e2e suite green; ~10 → ~220 pairs/s via the pipelined capture FIFO |
+| iOS Safari 18 (device) | external | verified working on device at tag `ios-safari-working-2026-11-08`; still the serial emit path (device-verified) — canvas capture now defaults off, so the iOS default is serial **bytes** emit: re-verify on device |
+| Firefox 159 | canvas | `importExternalTexture` absent → staged `texture_2d` sources; full e2e suite green; ~10 → ~310 pairs/s via the pipelined capture FIFO + batched motion readback |
 | WebKitGTK (Playwright) | — | shim exposes `navigator.gpu` but `requestAdapter()` returns null; parked |
 
 Benchmarks on this host (480×270 clips, median pairs/s, headed browsers,
 same AMD RDNA-3 GPU; `node bench/run-web-bench.mjs --headed
---page gpu-video/bench.html --skip-native`):
+--page gpu-video/bench.html --skip-native [--browser firefox]
+--capture-bytes`):
 
 | pipeline | clockwise | auto |
 | --- | --- | --- |
 | wasm CPU (Chrome) | 1427–1694 | 1084–1130 |
-| all-GPU (Chrome, canvas capture) | 467–580 | 507–659 |
-| all-GPU (Firefox, canvas capture) | 238–308 | 82–111 |
+| all-GPU (Chrome, bytes capture) | 1069–1150 | 682–732 |
+| all-GPU (Chrome, canvas capture) | 513–570 | 635–636 |
 | wasm CPU (Firefox) | 317–339 | 309–335 |
+| all-GPU (Firefox, bytes capture) | 286–312 | 249–290 |
+| all-GPU (Firefox, canvas capture) | 245–294 | 231–249 |
 
-Desktop throughput is not where the GPU pipeline wins — the wasm path's
-CPU-memory encoder feed beats the per-frame GPU→encoder handoff. Its
-edge is mobile (the original motivation: the `copyTo` frame copy that
-dominated iOS profiling) and zero-CPU pixel movement; Firefox `auto` is
-rate-limited by motion-sample readback latency on the GPU tick and
-would benefit from deeper readback pipelining.
+Bytes capture (packed BGRA readback → `new VideoFrame(bytes)`, pipelined
+16 deep) is the default on desktop: it roughly doubles Chrome's clockwise
+rate and lifts Firefox `auto` from 82–111 to 249–290 (batched motion
+readback — K frames share one `mapAsync`). Clockwise on Chrome now runs
+at ~65% of wasm; the residual is the GPU cost of YUV→RGB conversion,
+which every `texture_external` sample pays (~0.88 ms per sampling draw
+at 480×270 — `bench/probe-motion.html` isolates it: plain-texture motion
+passes hit 5.2k f/s vs 1.1k f/s with real frames). Converting once per
+frame into a `texture_2d` ("staged" source) was measured and rejected:
+`copyExternalImageToTexture` from `VideoFrame` costs 863 f/s vs 1134
+for draw-time sampling — the shader converting only what it reads wins.
+`auto` on Chrome (~700) sits at that sample-throughput ceiling: its
+motion passes add a second conversion per frame, and the remaining
+direction-tracking wait is ~K-invariant GPU time, not map latency
+(`bench/probe-depth.mjs`: depth 4 ≈ 16 ≈ 64, batch K 2…32 all noise).
+
+At 480×270 on this host wasm still leads; the GPU pipeline's edge is
+mobile (the original motivation: the `copyTo` frame copy that dominated
+iOS profiling) and zero-CPU pixel movement. The per-pair GPU cost is
+resolution-sensitive while the wasm CPU blend scales faster, so larger
+frames close the gap (see Follow-up).
 
 ## Follow-up — closing the desktop gap
 
-Ideas parked while the mobile path was the priority (numbers from the
-A/B runs above, 480×270 on this host):
+From the earlier A/B runs; status as of the desktop-performance pass:
 
-- **Pipeline Chrome's external-mode capture.** The depth-16 capture FIFO
-  (`issuePairPipelined`) only runs in canvas source mode; the external
-  path still waits on each pair's readback gate before issuing the next.
-  Chrome's `mapAsync` is ~2 ms serial (Firefox's is ~100 ms), so the win
-  is smaller but real — the gate wait is pure dead time between blends.
-- **Feed the encoder CPU bytes, not canvas snapshots.** Encode-only
-  ingest is 6429–9545 fps with `new VideoFrame(bytes)` vs ~1543 fps for
-  `new VideoFrame(canvas)` on the same machine. The `--bytes` readback
-  path already produces packed BGRA; using it as the primary encoder
-  feed on desktop (keeping canvas capture where the copy is expensive,
-  e.g. mobile) could lift the GPU path's 467–580 pairs/s substantially.
-- **Stage costs to attack.** Per pair the wasm path pays ~0.063 ms copy
-  + ~0.47 ms blend before an encoder feed that never stalls below
-  ~6400 fps; the GPU path pays a ~1.58 ms GPU→encoder crossing per pair.
-  That crossing, not GPU compute, is the gap — batching VideoFrames
-  through it (ring of pre-created frames, encoder-side queueing) is the
-  lever.
-- **Resolution crossover.** The per-pair crossing cost is roughly fixed
-  while the wasm copy+blend scales with pixels; at 1080p the wasm CPU
-  path drops toward the GPU path's rate and the GPU path overtakes it
+- **Pipeline Chrome's external-mode capture.** ✅ Done — the pipelined
+  FIFO (`issuePairPipelined`) now runs for external sources with bytes
+  capture too (non-iOS): each in-flight pair's decoded frames are closed
+  by refcount (`livePairs`/`released`) when the pair's gate resolves,
+  since the external view keeps the `VideoFrame` alive until the blend
+  pass has run. A depth sweep at 480×270 found depth irrelevant once
+  motion readbacks are batched (4 ≈ 16 ≈ 64), so one `CAPTURE_DEPTH = 16`
+  serves both modes.
+- **Feed the encoder CPU bytes, not canvas snapshots.** ✅ Done — bytes
+  capture is the default everywhere (`canvasCapture = false` in the
+  pipeline; the UI checkbox keeps canvas available). Chrome encode-only
+  ingest is ~9-10k fps through `new VideoFrame(bytes)` vs ~1.5k through
+  canvas, and clockwise went 467–580 → 1069–1150 pairs/s.
+- **Firefox `auto` direction tracking.** ✅ Done — motion samples are
+  read back in batches (`motion.js`: K=8 frames share one MAP_READ
+  buffer + one `mapAsync` armed at batch close; `flush()` closes the
+  tail). Firefox `auto` went 82–111 → 249–290 pairs/s; Chrome `auto`
+  320 → 682–732. The serial emit path (iOS, canvas capture) keeps the
+  per-frame await order.
+- **Conversion ceiling (what is left).** The GPU path converts YUV→RGB
+  on every external sample: the motion luma pass converts each frame
+  once, and the blend pass converts its two frames again. All measured
+  alternatives are equal or worse (staged `copyExternalImageToTexture`
+  per frame: 863 vs 1134 f/s; see the numbers above). Beating wasm at
+  small resolutions would mean sampling the YUV planes directly
+  (`texture_2d` views of the decoder surface — not exposed to WebGPU)
+  or sharing the conversion between motion and blend, neither of which
+  the platform currently allows. Accept ~65% of wasm at 480×270 on
+  desktop.
+- **Resolution crossover.** The per-pair GPU cost scales with pixels
+  but sublinearly vs the wasm CPU blend; at 1080p the wasm CPU path
+  drops toward the GPU path's rate and the GPU path overtakes it
   (measured directionally; worth pinning with `run-web-bench.mjs` at
   1080p before claiming a number).
-- **Firefox `auto` direction tracking.** 82–111 pairs/s is rate-limited
-  by motion-sample readback latency on the GPU tick; batching those
-  readbacks the way pair captures are batched should bring `auto` in
-  line with `clockwise` (238–308 pairs/s).
+- **WebKitGTK.** `requestAdapter()` returns null under the Playwright
+  shim; parked.
 
 ## Validation
 
