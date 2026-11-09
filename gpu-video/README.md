@@ -75,7 +75,7 @@ Files:
 | `shaders.js` | all WGSL: blend, luma, blit, box downsample, SAD compute (`makeSadCompute(tileW)`) |
 | `motion.js` | analysis geometry (ports `motion.rs`), CPU aggregation (`aggregateBlocks` reproduces `match_frames`' median + quality gate), `GpuMotion` pass driver |
 | `tracker.js` | line-for-line JS port of the Rust `DirectionTracker` |
-| `gpu-worker.js` | worker wrapper (protocol identical to `video-worker.js`) |
+| `../workers/gpu-worker.js` | worker wrapper (protocol identical to `../workers/video-worker.js`) |
 | `video.html` | the UI page |
 | `bench.html` | benchmark page, same `window.__benchResults` contract as `bench-video.html` |
 | `validate-shaders.mjs` | naga-based WGSL validation + workgroup-memory accounting |

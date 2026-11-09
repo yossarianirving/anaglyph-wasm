@@ -3,7 +3,36 @@
     "version": "0.1.0",
     "private": true,
     "type": "module",
-    "description": "Browser image/gif/video to anaglyph 3-D converter (wasm + WebGPU + WebCodecs)",
+    "description": "Browser video to anaglyph 3-D converter (WebGPU + wasm/WebCodecs) with a worker-based API",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/yossarianirving/anaglyph-wasm.git"
+    },
+    "main": "./index.js",
+    "types": "./index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./index.d.ts",
+            "default": "./index.js"
+        },
+        "./wasm": "./js/video-pipeline.js",
+        "./gpu": "./gpu-video/gpu-pipeline.js",
+        "./encoder-plan": "./js/encoder-plan.js",
+        "./workers/video": "./workers/video-worker.js",
+        "./workers/gpu": "./workers/gpu-worker.js",
+        "./pkg/anaglyph_wasm_bg.wasm": "./pkg/anaglyph_wasm_bg.wasm",
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "index.js",
+        "index.d.ts",
+        "js/",
+        "gpu-video/",
+        "workers/",
+        "pkg/",
+        "vendor/",
+        "README.md"
+    ],
     "scripts": {
         "build:wasm": "scripts/build-wasm.sh",
         "build:wasm:scalar": "scripts/build-wasm.sh --scalar",
