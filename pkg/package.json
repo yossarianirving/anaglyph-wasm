@@ -1,0 +1,15 @@
+{
+  "name": "anaglyph-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "anaglyph_wasm_bg.wasm",
+    "anaglyph_wasm.js",
+    "anaglyph_wasm.d.ts"
+  ],
+  "main": "anaglyph_wasm.js",
+  "types": "anaglyph_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

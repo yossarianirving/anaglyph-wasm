@@ -35,6 +35,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "anaglyph-rs"
 version = "0.1.0"
+source = "git+https://github.com/yossarianirving/anaglyph-rs.git?tag=0.1.0#7e8b594382b207ec57c8920b01ed1c793ea5f12f"
 dependencies = [
  "clap",
  "futures-channel",

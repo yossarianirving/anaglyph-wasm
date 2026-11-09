@@ -6,14 +6,18 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#anaglyph-rs = { git = "https://github.com/yossarianirving/anaglyph-rs.git", branch = "main" }
+anaglyph-rs = { git = "https://github.com/yossarianirving/anaglyph-rs.git", tag = "0.1.0" }
 # `gpu` (off by default; see [features]) switches gif blending to the
 # WebGPU compute path: gif_to_anaglyph_async then runs frames through
 # convert_gif_buffer_to_anaglyph_async with a CPU fallback.
-anaglyph-rs = { path = "../anaglyph-rs" }
+# Local co-development: keep a sibling checkout and use an uncommitted
+# cargo `paths = ["../anaglyph-rs"]` override instead of the tag.
+#anaglyph-rs = { path = "../anaglyph-rs" }
 image = { version = "0.25.5", features = ["gif"] }
 js-sys = "0.3"
-wasm-bindgen = "0.2.92"
+# Pinned exactly: the pkg/ JS glue must be produced by the matching
+# wasm-bindgen CLI (scripts/build-wasm.sh enforces this).
+wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
