@@ -5,9 +5,9 @@ use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph;
 #[cfg(target_arch = "wasm32")]
 use anaglyph_rs::gif::convert_gif_buffer_to_anaglyph_async;
 use image::{buffer::ConvertBuffer, imageops, RgbImage, RgbaImage};
-use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Uint8Array;
+use wasm_bindgen::prelude::*;
 extern crate web_sys;
 use image::ImageReader;
 use std::io::Cursor;
@@ -181,7 +181,7 @@ impl Anaglyph {
 
         let _timer = Timer::new("To Anaglyph");
 
-        convert_gif_buffer_to_anaglyph_async(&self.gif, direction, a_type)
+        convert_gif_buffer_to_anaglyph_async(&self.gif, direction, a_type, BlenderChoice::Cpu)
             .await
             .map_err(|e| JsValue::from_str(&format!("gif conversion failed: {e}")))
     }
