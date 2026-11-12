@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `video-unified.html`: engine default is now the wasm pipeline everywhere
+  except iPhone/iPad, which boot on the all-GPU WebGPU pipeline (all iOS
+  browsers are WebKit, so the device alone decides; a missing adapter still
+  self-heals through the wasm fallback retry). Previously the adapter picked
+  the default, so Chrome/Firefox with WebGPU started on the GPU pipeline;
+  `?engine=webgpu|wasm` now overrides in both directions.
+- `video-unified.html`: the result button says "Save" and opens the system
+  share sheet via the Web Share API where file sharing is supported
+  (`navigator.canShare`); other browsers keep the plain download.
+
 ## 0.1.0 — 2026-11-09
 
 First packaged release.

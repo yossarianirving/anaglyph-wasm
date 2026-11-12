@@ -21,9 +21,11 @@
             <p class="text-muted">
                 Both browser pipelines in one page: the all-GPU pipeline
                 (frames stay on the GPU end to end) and the wasm pipeline
-                (WebCodecs + SIMD/WebGPU blending). Defaults to WebGPU and
-                falls back to wasm automatically where WebGPU is missing.
-                Upload a stereo "360 booth" clip; "Auto, swapped eyes"
+                (WebCodecs + SIMD/WebGPU blending). Starts on the wasm
+                pipeline everywhere except iPhone and iPad, which start on
+                the all-GPU WebGPU pipeline; switch pipelines under Advanced
+                options. Upload a stereo "360 booth" clip; "Auto, swapped
+                eyes"
                 detects the orbit from image motion and swaps eyes when the
                 booth reverses.
             </p>
@@ -99,10 +101,10 @@
                                 >Pipeline:</label
                             >
                             <select class="form-select" id="engine">
-                                <option value="webgpu" selected>
+                                <option value="webgpu">
                                     WebGPU (all-GPU, no wasm)
                                 </option>
-                                <option value="wasm">
+                                <option value="wasm" selected>
                                     WASM (WebCodecs + SIMD blend)
                                 </option>
                             </select>
@@ -233,7 +235,7 @@
                 ></video>
                 <p class="mt-2">
                     <a id="download" class="btn btn-success" download="anaglyph.mp4"
-                        >Download result</a
+                        >Save</a
                     >
                 </p>
                 <table class="table table-sm table-striped" id="report" style="max-width: 42rem"></table>
@@ -248,9 +250,10 @@
              */
             import { checkSupport, createVideoConverter } from "./index.js";
 
-            var engine = "webgpu"; // engine the next run will use
+            var engine = "wasm"; // engine the next run will use
             var pickedFile = null;
             var objectUrl = null;
+            var resultFile = null; // File copy of the result for the Web Share API
 
             var submit = document.getElementById("submit");
             var cancel = document.getElementById("cancel");
@@ -345,8 +348,29 @@
                 video.src = url;
                 var download = document.getElementById("download");
                 download.href = url;
-                download.download =
+                var fileName =
                     "anaglyph." + (report.container === "webm" ? "webm" : "mp4");
+                download.download = fileName;
+                // Build a File for the Share sheet up front: navigator.share
+                // must be called with the file synchronously inside the click
+                // (user activation), so there is no room to fetch at share
+                // time. While this is pending the link just downloads.
+                resultFile = null;
+                fetch(url)
+                    .then(function (r) {
+                        return r.blob();
+                    })
+                    .then(function (blob) {
+                        if (objectUrl !== url) return; // a newer result won
+                        resultFile = new File([blob], fileName, {
+                            type:
+                                blob.type ||
+                                (report.container === "webm"
+                                    ? "video/webm"
+                                    : "video/mp4"),
+                        });
+                    })
+                    .catch(function () {}); // plain download stays available
                 var table = document.getElementById("report");
                 table.innerHTML = "";
                 for (const [key, value] of Object.entries(report)) {
@@ -457,10 +481,37 @@
                 converter.cancel();
             });
 
+            // "Save": where the browser can share files (iOS/Android Safari
+            // and Chrome, some desktop browsers) open the system share sheet;
+            // everywhere else the <a download> keeps doing its plain-download
+            // job untouched.
+            document
+                .getElementById("download")
+                .addEventListener("click", function (event) {
+                    if (
+                        !resultFile ||
+                        !navigator.canShare ||
+                        !navigator.canShare({ files: [resultFile] })
+                    ) {
+                        return;
+                    }
+                    event.preventDefault();
+                    navigator
+                        .share({ files: [resultFile], title: "Anaglyph result" })
+                        .catch(function (err) {
+                            if (err && err.name !== "AbortError") {
+                                setStatus(
+                                    "Share failed: " +
+                                        (err.message || err) +
+                                        " — Save will download instead.",
+                                );
+                            }
+                        });
+                });
+
             // Capability banner + engine default: WebCodecs is required by
-            // both pipelines; the WebGPU adapter picks which one boots. No
-            // adapter (or ?engine=wasm) → start on the wasm pipeline with the
-            // toggle already flipped.
+            // both pipelines. iPhone/iPad boot on WebGPU, every other
+            // browser on wasm; ?engine=webgpu|wasm overrides either way.
             (async function () {
                 var support = await checkSupport();
                 var lines = [];
@@ -476,17 +527,39 @@
                     "WebGPU: " + (support.webgpu ? "adapter available" : "not available"),
                 );
 
+                // Engine default: iPhone/iPad boot on the all-GPU pipeline
+                // (the device-verified path there; frames staying on the GPU
+                // also suits iOS memory pressure). Every iOS browser is
+                // WebKit, so the device alone is enough — no Safari
+                // sniffing. The second clause catches iPadOS "Desktop site"
+                // mode, whose UA claims Macintosh; real Macs have no touch
+                // points. All other browsers boot on the wasm pipeline even
+                // when an adapter is present; the choice stays switchable in
+                // Advanced options and via ?engine=webgpu|wasm.
+                var isIOSDevice =
+                    /iPhone|iPad/.test(navigator.userAgent) ||
+                    (navigator.platform === "MacIntel" &&
+                        navigator.maxTouchPoints > 1);
+                var engineParam = new URLSearchParams(location.search).get(
+                    "engine",
+                );
                 engine =
-                    new URLSearchParams(location.search).get("engine") === "wasm" ||
-                    !support.webgpu
-                        ? "wasm"
-                        : "webgpu";
+                    engineParam === "webgpu" || engineParam === "wasm"
+                        ? engineParam
+                        : isIOSDevice
+                          ? "webgpu"
+                          : "wasm";
                 engineSelect.value = engine;
-                var webgpuOption = engineSelect.querySelector('option[value="webgpu"]');
+                var webgpuOption = engineSelect.querySelector(
+                    'option[value="webgpu"]',
+                );
                 if (!support.webgpu) {
-                    webgpuOption.textContent = "WebGPU (all-GPU, no wasm) — not available here";
+                    webgpuOption.textContent =
+                        "WebGPU (all-GPU, no wasm) — not available here";
                     document.getElementById("engineNote").textContent =
-                        "No WebGPU adapter in this browser: the page starts on the wasm pipeline.";
+                        isIOSDevice
+                            ? "iPhone/iPad start on the WebGPU pipeline even though the probe found no adapter: if none answers at run time the page falls back to the wasm pipeline."
+                            : "No WebGPU adapter in this browser: only the wasm pipeline can run.";
                 }
                 var caps = document.getElementById("caps");
                 caps.textContent = lines.join("  · ");
